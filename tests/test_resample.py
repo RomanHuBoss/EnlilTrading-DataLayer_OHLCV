@@ -28,8 +28,6 @@ def test_resample_5m_shapes():
     assert list(out.columns) == ["o","h","l","c","v"]
 
 def test_missing_threshold():
-    df = _mk_df(10).drop(df := _mk_df(10).index[5])
-    try:
-        ensure_missing_threshold(df, threshold=0.2)  # 10% пропуск — ниже порога 20%
-    except Exception as e:
-        raise AssertionError(f"Не ожидали исключение: {e}")
+    df = _mk_df(10)
+    df = df.drop(index=df.index[5])
+    ensure_missing_threshold(df, threshold=0.2)

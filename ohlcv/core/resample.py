@@ -1,7 +1,7 @@
 # Ресемплинг OHLCV с 1m на агрегированные ТФ.
 import pandas as pd
 from typing import Literal
-from .timeframes import tf_to_pandas_rule
+from ..utils.timeframes import tf_to_pandas_rule
 
 def resample_ohlcv(df_1m: pd.DataFrame, to_tf: Literal["5m","15m","1h"]) -> pd.DataFrame:
     """
@@ -11,7 +11,6 @@ def resample_ohlcv(df_1m: pd.DataFrame, to_tf: Literal["5m","15m","1h"]) -> pd.D
     if not isinstance(df_1m.index, pd.DatetimeIndex) or df_1m.index.tz is None:
         raise ValueError("Ожидается tz-aware DatetimeIndex (UTC)")
     if df_1m.index.freq is None:
-        # Устанавливаем частоту 1 мин, если возможно
         try:
             df_1m = df_1m.asfreq("T")
         except Exception:
