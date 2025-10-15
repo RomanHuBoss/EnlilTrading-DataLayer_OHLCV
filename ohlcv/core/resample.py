@@ -12,7 +12,7 @@ def resample_ohlcv(df_1m: pd.DataFrame, to_tf: Literal["5m","15m","1h"]) -> pd.D
         raise ValueError("Ожидается tz-aware DatetimeIndex (UTC)")
     if df_1m.index.freq is None:
         try:
-            df_1m = df_1m.asfreq("T")
+            df_1m = df_1m.asfreq("min")
         except Exception:
             pass
 
@@ -25,6 +25,6 @@ def resample_ohlcv(df_1m: pd.DataFrame, to_tf: Literal["5m","15m","1h"]) -> pd.D
         "c": "last",
         "v": "sum",
     }
-    agg = df_1m.resample(rule, label="right", closed="right").agg(ohlc_dict).dropna()
-    agg = agg[["o","h","l","c","v"]]
-    return agg
+    # closed='left' устраняет лишний пустой бин на границе 00:00, оставляя две 5-минутки из 10 минут данных
+    agg = df_1m.resample(rule, label="right", closed="left").agg(ohlc_dict).dropna()
+    return agg[["o","h","l","c","v"]]

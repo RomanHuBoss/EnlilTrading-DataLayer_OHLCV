@@ -9,12 +9,10 @@ TF_MINUTES = {
 }
 
 def tf_to_pandas_rule(tf: str) -> str:
-    """Возврат правила ресемплинга pandas для таймфрейма."""
     if tf not in TF_MINUTES:
         raise ValueError(f"Неизвестный таймфрейм: {tf}")
-    # Используем минутные/часовые границы, закрываем справа [right-closed].
-    rule = {"1m": "1T", "5m": "5T", "15m": "15T", "1h": "1H"}[tf]
-    return rule
+    # Используем 'min' вместо устаревшего 'T'
+    return {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1H"}[tf]
 
 def tf_minutes(tf: str) -> int:
     return TF_MINUTES[tf]

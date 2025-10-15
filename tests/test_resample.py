@@ -7,7 +7,7 @@ from ohlcv.core.resample import resample_ohlcv
 from ohlcv.core.validate import validate_1m_index, ensure_missing_threshold
 
 def _mk_df(n=10, start="2024-01-01T00:00:00+00:00"):
-    idx = pd.date_range(pd.Timestamp(start), periods=n, freq="T", tz="UTC")
+    idx = pd.date_range(pd.Timestamp(start), periods=n, freq="min", tz="UTC")
     df = pd.DataFrame({
         "o": np.arange(n, dtype=float),
         "h": np.arange(n, dtype=float) + 1,
