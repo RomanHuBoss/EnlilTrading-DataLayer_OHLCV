@@ -1,5 +1,7 @@
-# Клиент загрузки OHLCV с Bybit v5 Market API c поддержкой потоковой выдачи чанков.
-# Документация: https://bybit-exchange.github.io/docs/v5/market/kline
+# ohlcv/api/bybit.py — Market v5: 1m OHLCV (чанки/буфер) + instruments-info.launchTime
+# Документация:
+#   Kline:            https://bybit-exchange.github.io/docs/v5/market/kline
+#   InstrumentsInfo:  https://bybit-exchange.github.io/docs/v5/market/instrument
 import time
 from typing import Iterable, List, Optional, Dict
 from datetime import datetime, timezone
@@ -21,7 +23,7 @@ def _sign(api_secret: str, payload: str) -> str:
     return hmac.new(api_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
-def _http_get(path: str, params: Dict, headers: Dict, timeout: int, max_retries: int, backoff_base: float) -> Response:
+def _http_get(path: str, params: Dict, headers: Dict, *, timeout: int, max_retries: int, backoff_base: float) -> Response:
     """
     Надёжный GET с экспоненциальным бэкоффом.
     Исключения/коды ≠200 → повтор до max_retries.
@@ -30,18 +32,39 @@ def _http_get(path: str, params: Dict, headers: Dict, timeout: int, max_retries:
     for attempt in range(max_retries):
         try:
             r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            # Бывает 429/5xx — уйдём на ретрай
             if r.status_code == 200:
                 return r
-            # Жёсткие ошибки — тоже ретрай
         except requests.RequestException:
             pass
-        # Бэкофф: base * 2^attempt
         time.sleep(backoff_base * (2 ** attempt))
-    # Последняя попытка без сна — пусть бросит исключение вызывающему
     r = requests.get(url, params=params, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r
+
+
+def get_launch_time(symbol: str, *, category: str = "linear", timeout: int = 30, max_retries: int = 5) -> Optional[datetime]:
+    """
+    Возвращает UTC datetime запуска инструмента для категорий linear|inverse (поле launchTime в мс).
+    Для spot, как правило, поле отсутствует → None.
+    """
+    path = "/v5/market/instruments-info"
+    params = {"category": category, "symbol": symbol}
+    r = _http_get(path, params, headers={}, timeout=timeout, max_retries=max_retries, backoff_base=0.2)
+    data = r.json()
+    if data.get("retCode") != 0:
+        return None
+    items = (data.get("result") or {}).get("list") or []
+    if not items:
+        return None
+    item = items[0]
+    lt = item.get("launchTime")
+    if lt is None:
+        return None
+    try:
+        ts_ms = int(lt)
+        return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).replace(second=0, microsecond=0)
+    except Exception:
+        return None
 
 
 def iter_klines_1m(
@@ -49,23 +72,17 @@ def iter_klines_1m(
     start: datetime,
     end: datetime,
     *,
-    category: str = "spot",             # допустимо: spot|linear|inverse
-    api_key: Optional[str] = None,      # read-only ключи по постановке
-    api_secret: Optional[str] = None,   # не используется на публичном эндпоинте
-    limit: int = 1000,                  # макс. на Bybit v5
-    sleep_sec: float = 0.2,             # пауза между запросами
-    max_retries: int = 5,               # надёжность на сетевых/5xx/429
-    timeout: int = 30                   # таймаут HTTP, сек
+    category: str = "spot",             # spot|linear|inverse
+    api_key: Optional[str] = None,      # read-only
+    api_secret: Optional[str] = None,   # не требуется для публичного маркет-эндпоинта
+    limit: int = 1000,
+    sleep_sec: float = 0.2,
+    max_retries: int = 5,
+    timeout: int = 30
 ) -> Iterable[List[Dict]]:
     """
     Итеративная загрузка 1m OHLCV: выдаёт чанки по мере получения.
-    Каждый чанк — список словарей баров, отсортированный по возрастанию времени.
-    Гарантии:
-      - временное окно [start, end) в UTC
-      - дубликаты на границах отфильтрованы вызывающим слоем по индексу
-
-    Формат бара:
-      {"ts": ISO8601 UTC, "o": float, "h": float, "l": float, "c": float, "v": float, "t": float|None}
+    Формат: {"ts","o","h","l","c","v","t?"}; окно [start, end), UTC.
     """
     if start.tzinfo is None or end.tzinfo is None:
         raise ValueError("start/end должны быть tz-aware UTC")
@@ -84,36 +101,31 @@ def iter_klines_1m(
             "category": category,
             "symbol": symbol,
             "interval": interval,
-            # ограничиваем окно так, чтобы сервер вернул не более ~limit баров
             "start": cursor,
             "end": min(end_ms, cursor + limit * 60_000),
             "limit": str(limit),
         }
         headers: Dict[str, str] = {}
         if api_key:
-            # Публичный маркет-эндпоинт не требует подписи, но ключ допустим.
             headers["X-BAPI-API-KEY"] = api_key
 
         r = _http_get(path, params, headers, timeout=timeout, max_retries=max_retries, backoff_base=sleep_sec)
-        # Если выше не бросило — статус 200 гарантирован
         data = r.json()
         if data.get("retCode") != 0:
-            # Прерывание — пусть внешний слой решает, ретраить ли весь цикл
             raise RuntimeError(f"Bybit error: {data.get('retCode')} {data.get('retMsg')}")
 
-        rows = data.get("result", {}).get("list") or []
+        rows = (data.get("result") or {}).get("list") or []
         if not rows:
-            # Пусто: сдвигаем курсор на limit минут, чтобы не зациклиться при редких дырах
             cursor += limit * 60_000
             time.sleep(sleep_sec)
             continue
 
-        # Bybit возвращает от нового к старому — разворачиваем.
+        # Ответ идёт от нового к старому — разворот.
         rows = list(reversed(rows))
 
         chunk: List[Dict] = []
         for row in rows:
-            # Формат v5: [start, open, high, low, close, volume, turnover, ...]
+            # row: [start, open, high, low, close, volume, turnover, ...]
             ts_ms = int(row[0])
             if ts_ms < start_ms or ts_ms >= end_ms:
                 continue
@@ -129,10 +141,8 @@ def iter_klines_1m(
 
         if chunk:
             yield chunk
-            # Следующая страница — от последней минуты + 60_000 мс
             cursor = int(rows[-1][0]) + 60_000
         else:
-            # Если всё отфильтровали границами окна — сдвиг на limit минут
             cursor += limit * 60_000
 
         time.sleep(sleep_sec)
@@ -151,10 +161,7 @@ def fetch_klines_1m(
     max_retries: int = 5,
     timeout: int = 30
 ) -> List[Dict]:
-    """
-    Совместимая обёртка поверх iter_klines_1m: возвращает единый список баров.
-    Используется там, где нужен не поток, а полный буфер.
-    """
+    """Буферизующая обёртка над iter_klines_1m."""
     out: List[Dict] = []
     for chunk in iter_klines_1m(
         symbol,
