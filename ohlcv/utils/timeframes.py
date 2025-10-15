@@ -11,8 +11,13 @@ TF_MINUTES = {
 def tf_to_pandas_rule(tf: str) -> str:
     if tf not in TF_MINUTES:
         raise ValueError(f"Неизвестный таймфрейм: {tf}")
-    # Используем 'min' вместо устаревшего 'T'
-    return {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1H"}[tf]
+    # Использовать новые алиасы pandas: min/h
+    return {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "1h": "1h",
+    }[tf]
 
 def tf_minutes(tf: str) -> int:
     return TF_MINUTES[tf]
