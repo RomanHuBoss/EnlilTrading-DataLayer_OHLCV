@@ -119,14 +119,14 @@ def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[dict], np.ndarray
             for ts in out.index[neg]:
                 issues.append({"ts": ts, "code": "NEG_V", "note": "negative volume -> 0"})
 
-    o = out["o"].to_numpy()
-    h = out["h"].to_numpy()
-    l = out["l"].to_numpy()
-    c = out["c"].to_numpy()
-    inv = (h < np.maximum(o, c)) | (l > np.minimum(o, c))
+    o_arr = out["o"].to_numpy()
+    h_arr = out["h"].to_numpy()
+    low_arr = out["l"].to_numpy()
+    c_arr = out["c"].to_numpy()
+    inv = (h_arr < np.maximum(o_arr, c_arr)) | (low_arr > np.minimum(o_arr, c_arr))
     if inv.any():
-        h_fix = np.maximum(h, np.maximum(o, c))
-        l_fix = np.minimum(l, np.minimum(o, c))
+        h_fix = np.maximum(h_arr, np.maximum(o_arr, c_arr))
+        l_fix = np.minimum(low_arr, np.minimum(o_arr, c_arr))
         out.loc[out.index[inv], "h"] = h_fix[inv]
         out.loc[out.index[inv], "l"] = l_fix[inv]
         flags[inv] |= (1 << BIT_INV_OHLC)
@@ -202,16 +202,23 @@ def _self_cov() -> None:
     validate(df0, tf="5m")
 
     # 4) NEG_V
-    df_neg = df0.copy(); df_neg.loc[idx[1], "v"] = -1.0; validate(df_neg, tf="1m")
+    df_neg = df0.copy()
+    df_neg.loc[idx[1], "v"] = -1.0
+    validate(df_neg, tf="1m")
 
     # 5) INV_OHLC
-    df_inv = df0.copy(); df_inv.loc[idx[2], ["h", "l"]] = [df_inv.loc[idx[2], "o"] - 1.0, df_inv.loc[idx[2], "c"] + 1.0]; validate(df_inv, tf="1m")
+    df_inv = df0.copy()
+    df_inv.loc[idx[2], ["h", "l"]] = [df_inv.loc[idx[2], "o"] - 1.0, df_inv.loc[idx[2], "c"] + 1.0]
+    validate(df_inv, tf="1m")
 
     # 6) GAP+MISSING_FILLED
-    df_gap = df0.drop(idx[1]); validate(df_gap, tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
+    df_gap = df0.drop(idx[1])
+    validate(df_gap, tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
 
     # 7) is_gap столбец уже есть
-    df_has_gap = df0.copy(); df_has_gap["is_gap"] = False; validate(df_has_gap, tf="1m")
+    df_has_gap = df0.copy()
+    df_has_gap["is_gap"] = False
+    validate(df_has_gap, tf="1m")
 
     # 8) MISALIGNED_TS
     idx_mis = pd.DatetimeIndex([idx[0] + pd.Timedelta(seconds=10), idx[1] + pd.Timedelta(seconds=10)], tz="UTC")
@@ -224,10 +231,13 @@ def _self_cov() -> None:
     validate(df_dup, tf="1m", config=QualityConfig(misaligned_tolerance_seconds=1))
 
     # 10) t-столбец в синтетике
-    df_t = df0.copy(); df_t["t"] = [0.1, 0.2, 0.3]; validate(df_t.drop(df_t.index[1]), tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
+    df_t = df0.copy()
+    df_t["t"] = [0.1, 0.2, 0.3]
+    validate(df_t.drop(df_t.index[1]), tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
 
     # 11) miss_rate > threshold ветка (без заполнения)
-    df_skip = df0.drop(idx[1]); validate(df_skip, tf="1m", config=QualityConfig(missing_fill_threshold=0.0))
+    df_skip = df0.drop(idx[1])
+    validate(df_skip, tf="1m", config=QualityConfig(missing_fill_threshold=0.0))
 
     # 12) _ensure_utc_index ValueError
     try:

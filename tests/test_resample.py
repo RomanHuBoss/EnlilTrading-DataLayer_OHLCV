@@ -11,9 +11,9 @@ def _mk_df(n: int, start: str = "2024-01-01T00:00:00Z") -> pd.DataFrame:
     o = np.linspace(100.0, 100.0 + n - 1, n)
     c = o + 0.1
     h = np.maximum(o, c)
-    l = np.minimum(o, c)
+    low = np.minimum(o, c)
     v = np.ones(n)
-    return pd.DataFrame({"o": o, "h": h, "l": l, "c": c, "v": v}, index=idx)
+    return pd.DataFrame({"o": o, "h": h, "l": low, "c": c, "v": v}, index=idx)
 
 
 def test_validate_ok():

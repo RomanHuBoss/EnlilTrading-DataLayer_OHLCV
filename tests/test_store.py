@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import pyarrow.parquet as pq
 
-from ohlcv.io.parquet_store import write_idempotent, parquet_path
+from ohlcv.io.parquet_store import write_idempotent
 
 
 def _mk_df(idx):
@@ -10,9 +10,9 @@ def _mk_df(idx):
     o = np.linspace(100.0, 100.0 + n - 1, n)
     c = o + 0.1
     h = np.maximum(o, c)
-    l = np.minimum(o, c)
+    low = np.minimum(o, c)
     v = np.ones(n)
-    return pd.DataFrame({"o": o, "h": h, "l": l, "c": c, "v": v}, index=idx)
+    return pd.DataFrame({"o": o, "h": h, "l": low, "c": c, "v": v}, index=idx)
 
 
 def test_write_and_merge(tmp_path):

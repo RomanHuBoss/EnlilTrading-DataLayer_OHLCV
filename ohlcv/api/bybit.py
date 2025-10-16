@@ -151,10 +151,13 @@ def _rows_from_kline_list(lst: List[List[str]]) -> List[Dict[str, float]]:
     out: List[Dict[str, float]] = []
     for it in lst:
         start_ms = int(it[0])
-        o = float(it[1]); h = float(it[2]); l = float(it[3]); c = float(it[4])
+        o = float(it[1])
+        high = float(it[2])
+        low = float(it[3])
+        c = float(it[4])
         v = float(it[5])
         ts_iso = _iso_from_ms(start_ms + 60_000)  # правая граница
-        row: Dict[str, float] = {"ts": ts_iso, "o": o, "h": h, "l": l, "c": c, "v": v}
+        row: Dict[str, float] = {"ts": ts_iso, "o": o, "h": high, "l": low, "c": c, "v": v}
         if len(it) > 6:
             try:
                 row["t"] = float(it[6])

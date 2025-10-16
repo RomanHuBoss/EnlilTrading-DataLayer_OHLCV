@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
-from typing import Dict, Any
+from typing import Dict
 
 # Каноническая схема входа для C3
 EXPECTED_DTYPES: Dict[str, str] = {
