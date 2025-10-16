@@ -3,6 +3,7 @@ pandas>=2.2
 pyarrow>=15
 requests>=2.31
 filelock>=3.12
+pyyaml>=6  # для --config в features-core
 
 # Dev (optional)
 pytest>=7
@@ -11,3 +12,4 @@ black>=24
 isort>=5
 mypy>=1.8
 numba>=0.59  # optional for acceleration
+pre-commit>=4.3.0

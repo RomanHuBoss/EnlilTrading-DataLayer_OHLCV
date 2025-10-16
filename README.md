@@ -1,6 +1,25 @@
-# DataLayer_OHLCV
+# OHLCV Pipeline — C1 / C2 / C3
 
-Цель: C1 (DataLayer.OHLCV) и C2 (DataQuality) по постановкам от 2025‑10‑15.
+Назначение: единый репозиторий для трёх компонентов пайплайна по временным рядам рынка:
+C1 — загрузка и нормализация OHLCV,
+C2 — контроль качества и подготовка валидированных артефактов,
+C3 — расчёт детерминированных признаков поверх валидированных баров.
+
+## Состав компонентов
+
+- **C1 · DataLayer.OHLCV** — импорт, нормализация, ресемплинг, идемпотентная запись Parquet, отчёты пропусков.
+- **C2 · DataQuality** — валидация, санитайз, сводные отчёты качества, флаги DQ на данных.
+- **C3 · Features.Core** — вычисление признаков из валидированных OHLCV; без внешних TA-зависимостей; pandas-only.
+
+## Требования
+
+- Python 3.11+
+- pandas >= 2.2 (требуется для C3; совместимо с C1/C2)
+- Остальные зависимости — см. `requirements.txt`
+
+## CLI (сводка)
+
+## C1/C2
 
 ## Возможности
 
@@ -56,6 +75,30 @@ Parquet per `(symbol, tf)`; обязательные колонки: `ts, o, h, 
 * Логи интеграции: `docs/releases/<DATE>/integration.log`
 * Проверка задержки: `tools/check_latency.py`
 
+```bash
+features-core build   --input path/to/ohlcv.csv   --symbol BTCUSDT   --tf 5m   --config configs/features.example.yaml   --output out/BTCUSDT_5m_features.parquet
+```
+
+## C3 · Features.Core
+
+### Вход/выход
+- Вход: CSV/Parquet из C2 с колонками `timestamp_ms,start_time_iso,open,high,low,close,volume,(turnover?)`; допускается внутренняя схема `o,h,l,c,v,(t?)` (автопереименование).
+- Выход: исходные поля + признаки `f_*`, а также `symbol`, `tf`, `f_valid_from`, `f_build_version`.
+
+### Набор признаков по умолчанию
+- Доходности/вола: `f_ret1`, `f_logret1`, `f_rv_20`, `f_rv_60`
+- Свечные: `f_range_pct`, `f_body_pct`, `f_wick_upper_pct`, `f_wick_lower_pct`, `f_tr`, `f_atr_14`, `f_atr_pct_14`
+- Тренд/моментум: `f_ema_20`, `f_ema_slope_20`, `f_mom_20`, `f_rsi14`, `f_pdi14`, `f_mdi14`, `f_adx14`
+- Donchian 20: `f_donch_h_20`, `f_donch_l_20`, `f_donch_break_dir_20`, `f_donch_width_pct_20`
+- Z-score: `f_close_z_20`, `f_close_z_60`, `f_range_z_20`, `f_range_z_60`, `f_vol_z_20`, `f_vol_z_60`
+- Объёмы: `f_upvol_20`, `f_downvol_20`, `f_vol_balance_20`, `f_obv`
+- VWAP: `f_vwap_roll_96`, `f_vwap_dev_pct_96`, `f_vwap_session`, `f_vwap_session_dev_pct`
+
+### Версионирование сборок признаков
+`f_build_version = C3.Features.Core@0.1.0+<hash12>`; хэш учитывает git-ревизию и параметры.
+
+---
+
 ## CI
 
 * Покрытие для `ohlcv/quality`: 100% (`pytest-cov`).
@@ -66,3 +109,4 @@ Parquet per `(symbol, tf)`; обязательные колонки: `ts, o, h, 
 
 * [C1 Data Layer](docs/specs/C1-Data%20Layer.pdf)
 * [C2 Data Quality](docs/specs/C2-Data%20Quality.pdf)
+* [C3 Features](docs/specs/C3-Features.pdf)

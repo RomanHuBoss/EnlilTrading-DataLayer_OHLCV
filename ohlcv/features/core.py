@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Any, Tuple
 
+from .schema import normalize_and_validate
+
 EPS = 1e-12
 
 DEFAULTS = {
@@ -16,30 +18,7 @@ DEFAULTS = {
     "adx_period": 14,
     "ema_windows": [20],
     "mom_windows": [20],
-    "kama_period": None,
 }
-
-
-def _maybe_map_internal_cols(df: pd.DataFrame) -> pd.DataFrame:
-    # Поддержка внутренней схемы C1/C2: o,h,l,c,v,(t) -> open,high,low,close,volume,(turnover)
-    cols = set(df.columns)
-    if {"o","h","l","c","v"}.issubset(cols):
-        mapping = {"o":"open","h":"high","l":"low","c":"close","v":"volume"}
-        if "t" in cols:
-            mapping["t"] = "turnover"
-        df = df.rename(columns=mapping)
-    return df
-
-
-def _ensure_cols(df: pd.DataFrame) -> None:
-    req = {"timestamp_ms", "start_time_iso", "open", "high", "low", "close", "volume"}
-    miss = sorted(list(req - set(df.columns)))
-    if miss:
-        raise ValueError(f"Отсутствуют обязательные колонки: {miss}")
-    for c in ["open","high","low","close","volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "turnover" in df.columns:
-        df["turnover"] = pd.to_numeric(df["turnover"], errors="coerce")
 
 def _logret(c: pd.Series) -> pd.Series:
     return np.log(c / c.shift(1)).replace([np.inf, -np.inf], np.nan)
@@ -69,7 +48,7 @@ def atr_wilder(h: pd.Series, l: pd.Series, c: pd.Series, n: int) -> pd.Series:
     tr = true_range(h, l, c)
     return ema(tr, n)
 
-def di_adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int) -> Tuple[pd.Series,pd.Series,pd.Series]:
+def di_adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
     up_move = h.diff()
     down_move = -l.diff()
     plus_dm = ((up_move > down_move) & (up_move > 0)).astype(float) * up_move.clip(lower=0.0)
@@ -81,7 +60,7 @@ def di_adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int) -> Tuple[pd.Series,
     adx = ema(dx, n)
     return pdi, mdi, adx
 
-def donchian(h: pd.Series, l: pd.Series, n: int) -> Tuple[pd.Series,pd.Series]:
+def donchian(h: pd.Series, l: pd.Series, n: int) -> Tuple[pd.Series, pd.Series]:
     hh = h.rolling(n, min_periods=n).max()
     ll = l.rolling(n, min_periods=n).min()
     return hh, ll
@@ -113,13 +92,16 @@ def obv(close: pd.Series, vol: pd.Series) -> pd.Series:
 
 def compute_features(df: pd.DataFrame, symbol: str, tf: str, params: Dict[str, Any] | None = None) -> pd.DataFrame:
     params = {**DEFAULTS, **(params or {})}
-    _ensure_cols(df)
-    df = _maybe_map_internal_cols(df)
-    out = df.copy()
+    strict = bool(params.get("strict", False))
 
+    # Нормализация входа и проверка схемы
+    df = normalize_and_validate(df, strict=strict)
+
+    out = df.copy()
     c, h, l, o, v = out["close"], out["high"], out["low"], out["open"], out["volume"]
     logret = _logret(c)
 
+    # Доходности/вола
     out["f_ret1"] = c.pct_change()
     out["f_logret1"] = logret
     for n in params["rv_windows"]:
@@ -129,6 +111,7 @@ def compute_features(df: pd.DataFrame, symbol: str, tf: str, params: Dict[str, A
     out["f_wick_upper_pct"] = (h - np.maximum(c, o)) / (c + EPS)
     out["f_wick_lower_pct"] = (np.minimum(c, o) - l) / (c + EPS)
 
+    # Тренд/моментум
     for n in params["ema_windows"]:
         out[f"f_ema_{n}"] = ema(c, n)
         out[f"f_ema_slope_{n}"] = out[f"f_ema_{n}"].diff()
@@ -146,6 +129,7 @@ def compute_features(df: pd.DataFrame, symbol: str, tf: str, params: Dict[str, A
     out[f"f_atr_{n_atr}"] = atr_wilder(h, l, c, n_atr)
     out[f"f_atr_pct_{n_atr}"] = out[f"f_atr_{n_atr}"] / (c + EPS)
 
+    # Donchian
     n_d = int(params["donch_window"])
     hi, lo = donchian(h, l, n_d)
     out[f"f_donch_h_{n_d}"] = hi
@@ -156,12 +140,14 @@ def compute_features(df: pd.DataFrame, symbol: str, tf: str, params: Dict[str, A
     out[f"f_donch_break_dir_{n_d}"] = brk
     out[f"f_donch_width_pct_{n_d}"] = (hi - lo) / (c + EPS)
 
+    # Z-scores
     out["f_range"] = (h - l)
     for n in params["z_windows"]:
         out[f"f_close_z_{n}"] = zscore(c, n)
         out[f"f_range_z_{n}"] = zscore(out["f_range"], n)
         out[f"f_vol_z_{n}"] = zscore(v, n)
 
+    # Объёмы
     up_mask = c > c.shift(1)
     down_mask = c < c.shift(1)
     for n in params.get("vol_windows", [20]):
@@ -172,15 +158,18 @@ def compute_features(df: pd.DataFrame, symbol: str, tf: str, params: Dict[str, A
         out[f"f_vol_balance_{n}"] = (upv - dnv) / (upv + dnv + EPS)
     out["f_obv"] = obv(c, v)
 
+    # VWAP
     n_vroll = int(params["vwap_roll_window"])
     out[f"f_vwap_roll_{n_vroll}"] = vwap_rolling(out, n_vroll)
     out[f"f_vwap_dev_pct_{n_vroll}"] = (c - out[f"f_vwap_roll_{n_vroll}"]) / (out[f"f_vwap_roll_{n_vroll}"] + EPS)
     out["f_vwap_session"] = vwap_session(out)
     out["f_vwap_session_dev_pct"] = (c - out["f_vwap_session"]) / (out["f_vwap_session"] + EPS)
 
+    # Служебные
     out["symbol"] = str(symbol)
     out["tf"] = str(tf)
 
+    # f_valid_from — первый индекс со всеми валидными f_*
     fcols = [c for c in out.columns if c.startswith("f_")]
     first_valid = 0
     if fcols:

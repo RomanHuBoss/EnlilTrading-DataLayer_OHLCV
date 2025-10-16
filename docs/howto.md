@@ -1,3 +1,42 @@
+# HOWTO — C1 / C2 / C3
+
+Назначение: практические сценарии по запуску и эксплуатации всего пайплайна.
+Сценарии C1 и C2 сохраняются как в оригинале; добавлен самостоятельный раздел C3.
+
+## Состав компонентов
+
+- **C1 · DataLayer.OHLCV** — backfill/update, ресемплинг, отчёты пропусков, формат Parquet.
+- **C2 · DataQuality** — validate/sanitize, отчёты issues и summary.
+- **C3 · Features.Core** — генерация признаков из валидированных данных.
+
+## C3: сценарии
+
+### Генерация признаков из CSV/Parquet
+```bash
+features-core build   --input data/BTCUSDT/5m.csv   --symbol BTCUSDT   --tf 5m   --output out/BTCUSDT_5m_features.parquet
+```
+
+### Кастомизация окон через YAML
+```bash
+cp configs/features.example.yaml configs/features.yaml
+features-core build   --input data/ETHUSDT/1h.parquet   --symbol ETHUSDT   --tf 1h   --config configs/features.yaml   --output out/ETHUSDT_1h_features.parquet
+```
+
+### Экспорт в CSV
+```bash
+features-core build --input data.csv --symbol BTCUSDT --tf 15m --output out/BTCUSDT_15m_features.csv
+```
+
+### Замечания
+- Минимальный вход: `timestamp_ms,start_time_iso,open,high,low,close,volume`.
+- Допускается внутренняя схема `o,h,l,c,v,(t?)` — автопереименование в C3.
+- `f_valid_from` — первая строка без NaN среди всех `f_*`.
+- `f_build_version` зависит от git‑ревизии и параметров.
+
+---
+
+## Оригинальная инструкция C1/C2 (без изменений)
+
 # HOWTO · DataLayer_OHLCV (C1 + C2)
 
 Цель: поднять окружение, загрузить 1m, календаризовать, ресемплировать 5m/15m/1h, прогнать DataQuality, выписать отчёты. Все времена — UTC.

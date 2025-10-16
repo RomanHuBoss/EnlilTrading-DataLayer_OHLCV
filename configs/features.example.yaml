@@ -1,10 +1,18 @@
+# Пример параметров для C3 · Features.Core
+# Значения можно переопределять в отдельном файле и передавать через --config
+
 rv_windows: [20, 60]
 ema_windows: [20]
 mom_windows: [20]
 rsi_period: 14
 adx_period: 14
 atr_period: 14
+
 donch_window: 20
 z_windows: [20, 60]
+
 vwap_roll_window: 96
 vol_windows: [20]
+
+# Строгая проверка входных данных (NaN/inf и схема). Может быть также задана флагом CLI --strict
+strict: false

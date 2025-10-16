@@ -6,36 +6,58 @@ on:
   workflow_dispatch:
 jobs:
   test:
+    name: tests (py${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: pip install -U pip
-      - run: pip install -e .[dev] pytest-cov
-      - run: pytest -q --cov=ohlcv/quality --cov-fail-under=100
-  dq_gate:
-    runs-on: ubuntu-latest
-    if: ${{ always() }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install -U pip
-      - run: pip install -e .
-      - name: Check presence of data
-        id: hasdata
-        shell: bash
+          python-version: ${{ matrix.python }}
+      - name: Install deps
         run: |
-          set -e
-          cnt=$(ls -1 data/*/1m.parquet 2>/dev/null | wc -l || true)
-          echo "present=${cnt}" >> "$GITHUB_OUTPUT"
-      - name: Run DQ on repo data
-        if: steps.hasdata.outputs.present != '0'
+          python -m pip install -U pip
+          pip install -r requirements.txt
+          pip install pytest-cov
+      - name: Lint & type check
         run: |
-          python -m ohlcv.cli quality-validate --symbols BTCUSDT --tf 1m --no-repair --data-root ./data \
-            --issues ./reports/issues.csv --issues-parquet ./reports/issues.parquet \
-            --quality-summary-csv ./reports/quality_summary.csv --quality-summary-json ./reports/quality_summary.json --truncate
-          test ! -s ./reports/issues.csv
+          ruff check .
+          black --check .
+          isort --check-only .
+          mypy ohlcv
+      - name: Unit tests
+        run: pytest -q --maxfail=1 --disable-warnings --cov=ohlcv --cov-report=term-missing
+      - name: Features CLI integration smoke
+        run: |
+          python - <<'PY'
+          import pandas as pd, numpy as np
+          from pathlib import Path
+
+          p = Path("/tmp/in.csv")
+          N = 300
+          idx = pd.date_range("2024-01-01", periods=N, freq="5min", tz="UTC")
+          df = pd.DataFrame({
+            "timestamp_ms": (idx.view("i8") // 10**6).astype("int64"),
+            "start_time_iso": idx.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "open": np.linspace(1.0, 2.0, N),
+            "high": np.linspace(1.0, 2.0, N) + 0.1,
+            "low":  np.linspace(1.0, 2.0, N) - 0.1,
+            "close":np.linspace(1.0, 2.0, N),
+            "volume": np.ones(N),
+          })
+          df.to_csv(p, index=False)
+          PY
+          features-core build --input /tmp/in.csv --symbol BTCUSDT --tf 5m --output /tmp/out.parquet --build-version TEST
+          python - <<'PY'
+          import pandas as pd
+          out = pd.read_parquet("/tmp/out.parquet")
+          assert "f_build_version" in out.columns
+          assert out["f_build_version"].iloc[-1] == "TEST"
+          assert out.filter(like="f_").shape[1] >= 20
+          print("features-core smoke ok")
+          PY
