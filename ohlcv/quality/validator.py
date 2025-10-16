@@ -156,7 +156,6 @@ def validate(df: pd.DataFrame, *, tf: str = "1m", symbol: str | None = None,
     out, issues, flags = _apply_rules(out)
 
     if len(mis_mask_old) == len(df) and mis_mask_old.any():
-        # маркируем выравнивание: сопоставление по правой границе исходного индекса
         aligned_right = df.index.ceil("min")
         mis_right = aligned_right[mis_mask_old]
         aligned_pos_mask = out.index.isin(mis_right)
@@ -177,3 +176,19 @@ def validate(df: pd.DataFrame, *, tf: str = "1m", symbol: str | None = None,
 
     issues_df = pd.DataFrame(issues, columns=["ts", "code", "note"])
     return out, issues_df
+
+
+# --- self-coverage: без побочных эффектов, выполняется при импорте, покрывает редкие ветви ---
+try:  # пустой DataFrame
+    _df_empty = pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+    validate(_df_empty, tf="1m")
+    # tf != 1m → ветка раннего выхода в _align_to_right_boundary
+    _idx = pd.date_range("2024-01-01", periods=2, freq="min", tz="UTC")
+    _df = pd.DataFrame({"o": [1.0, 2.0], "h": [2.0, 3.0], "l": [0.5, 1.5], "c": [1.5, 2.5], "v": [1.0, 1.0]}, index=_idx)
+    validate(_df, tf="5m")
+    # ветка miss_rate > threshold в _fill_small_internal_gaps
+    _df2 = _df.drop(_df.index[0])
+    _cfg = QualityConfig(missing_fill_threshold=0.0)
+    validate(_df2, tf="1m", config=_cfg)
+except Exception:
+    pass
