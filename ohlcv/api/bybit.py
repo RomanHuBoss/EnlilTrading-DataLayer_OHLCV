@@ -1,9 +1,9 @@
-# ohlcv/api/bybit.py — Market v5: 1m OHLCV (чанки/буфер) + instruments-info.launchTime
+# ohlcv/api/bybit.py — Market v5: 1m OHLCV (чанки/буфер) + instruments-info.launchTime + heartbeat callback
 # Документация:
 #   Kline:            https://bybit-exchange.github.io/docs/v5/market/kline
 #   InstrumentsInfo:  https://bybit-exchange.github.io/docs/v5/market/instrument
 import time
-from typing import Iterable, List, Optional, Dict
+from typing import Iterable, List, Optional, Dict, Callable
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -14,20 +14,14 @@ BASE_URL = "https://api.bybit.com"
 
 
 def _ms(dt: datetime) -> int:
-    """Datetime → миллисекунды UNIX. Ожидается tz-aware UTC."""
     return int(dt.timestamp() * 1000)
 
 
 def _sign(api_secret: str, payload: str) -> str:
-    """HMAC-SHA256 подпись. Для публичных маркет-эндпоинтов не требуется."""
     return hmac.new(api_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
 def _http_get(path: str, params: Dict, headers: Dict, *, timeout: int, max_retries: int, backoff_base: float) -> Response:
-    """
-    Надёжный GET с экспоненциальным бэкоффом.
-    Исключения/коды ≠200 → повтор до max_retries.
-    """
     url = BASE_URL + path
     for attempt in range(max_retries):
         try:
@@ -78,11 +72,13 @@ def iter_klines_1m(
     limit: int = 1000,
     sleep_sec: float = 0.2,
     max_retries: int = 5,
-    timeout: int = 30
+    timeout: int = 30,
+    on_advance: Optional[Callable[[int, int], None]] = None,  # callback(cursor_ms, end_ms) — вызывается при каждом сдвиге курсора
 ) -> Iterable[List[Dict]]:
     """
     Итеративная загрузка 1m OHLCV: выдаёт чанки по мере получения.
     Формат: {"ts","o","h","l","c","v","t?"}; окно [start, end), UTC.
+    on_advance: вызывается при любом продвижении курсора, даже если ответ пустой.
     """
     if start.tzinfo is None or end.tzinfo is None:
         raise ValueError("start/end должны быть tz-aware UTC")
@@ -117,15 +113,15 @@ def iter_klines_1m(
         rows = (data.get("result") or {}).get("list") or []
         if not rows:
             cursor += limit * 60_000
+            if on_advance:
+                on_advance(min(cursor, end_ms), end_ms)
             time.sleep(sleep_sec)
             continue
 
-        # Ответ идёт от нового к старому — разворот.
         rows = list(reversed(rows))
 
         chunk: List[Dict] = []
         for row in rows:
-            # row: [start, open, high, low, close, volume, turnover, ...]
             ts_ms = int(row[0])
             if ts_ms < start_ms or ts_ms >= end_ms:
                 continue
@@ -140,10 +136,16 @@ def iter_klines_1m(
             })
 
         if chunk:
+            # продвинулись до правого края возвращённого окна
+            last_ms = int(rows[-1][0]) + 60_000
+            if on_advance:
+                on_advance(min(last_ms, end_ms), end_ms)
             yield chunk
-            cursor = int(rows[-1][0]) + 60_000
+            cursor = last_ms
         else:
             cursor += limit * 60_000
+            if on_advance:
+                on_advance(min(cursor, end_ms), end_ms)
 
         time.sleep(sleep_sec)
 
@@ -161,7 +163,6 @@ def fetch_klines_1m(
     max_retries: int = 5,
     timeout: int = 30
 ) -> List[Dict]:
-    """Буферизующая обёртка над iter_klines_1m."""
     out: List[Dict] = []
     for chunk in iter_klines_1m(
         symbol,

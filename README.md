@@ -22,7 +22,7 @@ DoD:
 Запуск (пример):
 ```
 python -m ohlcv.cli backfill --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT --since 2024-10-15 --tf 1m
-python -m ohlcv.cli update --symbols BTCUSDT,ETHUSDT --tf 1m
+python -m ohlcv.cli update --symbols BTCUSDT,ETHUSDT
 python -m ohlcv.cli resample --symbols BTCUSDT,ETHUSDT --from-tf 1m --to-tf 5m
 python -m ohlcv.cli report-missing --symbols BTCUSDT,ETHUSDT --tf 1m --out /mnt/data/missing_report.csv
 ```

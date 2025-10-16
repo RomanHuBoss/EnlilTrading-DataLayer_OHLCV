@@ -1,5 +1,4 @@
-# ohlcv/cli.py — CLI с прогрессом, репарацией 1m, корнем данных (--data-root),
-# категорией рынка (--category) и выравниванием спота по дате запуска фьючерса (--spot-align-futures)
+# ohlcv/cli.py — heartbeat в «пустых» окнах: прогресс печатается даже до первой реальной свечи
 import os
 import argparse
 from pathlib import Path
@@ -45,12 +44,19 @@ def _print_progress(sym: str, fetched: int, total: int, last_ts: datetime, start
     )
 
 
-def _min_launch_time(symbol: str):
-    lt_lin = get_launch_time(symbol, category="linear")
-    lt_inv = get_launch_time(symbol, category="inverse")
-    if lt_lin and lt_inv:
-        return min(lt_lin, lt_inv)
-    return lt_lin or lt_inv
+def _hb_printer(sym: str, since: datetime, until: datetime):
+    # Печать «живости» даже при пустых страницах: раз в 6 часов данных или чаще на старте
+    state = {"last_ms": None}
+    total_ms = int((until - since).total_seconds() * 1000) or 1
+
+    def _cb(cursor_ms: int, end_ms: int):
+        if state["last_ms"] is None or (cursor_ms - state["last_ms"]) >= 6 * 60 * 60 * 1000:
+            dt = datetime.fromtimestamp(cursor_ms / 1000, tz=timezone.utc)
+            pct = (cursor_ms - int(since.timestamp() * 1000)) / total_ms * 100.0
+            _print(f"[{sym}] scanning… up to {dt.strftime('%Y-%m-%d %H:%M')}Z ({pct:5.1f}%)")
+            state["last_ms"] = cursor_ms
+
+    return _cb
 
 
 def cmd_backfill(args):
@@ -66,7 +72,9 @@ def cmd_backfill(args):
     for sym in symbols:
         eff_since = since
         if args.category == "spot" and args.spot_align_futures:
-            fut_lt = _min_launch_time(sym)
+            # выровнять по минимальному launchTime фьючерсов
+            lt_candidates = [get_launch_time(sym, category=c) for c in ("linear", "inverse")]
+            fut_lt = min([lt for lt in lt_candidates if lt], default=None)
             if fut_lt and fut_lt > eff_since:
                 eff_since = fut_lt
                 _print(f"[{sym}] spot aligned to futures launchTime → {eff_since.isoformat()}")
@@ -77,6 +85,7 @@ def cmd_backfill(args):
         _print(f"[{sym}] backfill 1m {eff_since.isoformat()} → {until.isoformat()}  total≈{total} bars")
 
         acc = []
+        heartbeat = _hb_printer(sym, eff_since, until)
         for chunk in iter_klines_1m(
             sym,
             eff_since,
@@ -84,6 +93,7 @@ def cmd_backfill(args):
             api_key=os.getenv("BYBIT_API_KEY"),
             api_secret=os.getenv("BYBIT_API_SECRET"),
             category=args.category,
+            on_advance=heartbeat,
         ):
             acc.extend(chunk)
             fetched += len(chunk)
@@ -124,18 +134,23 @@ def cmd_update(args):
         else:
             start = end - pd.Timedelta(days=7)
             if args.category == "spot" and args.spot_align_futures:
-                fut_lt = _min_launch_time(sym)
+                lt_candidates = [get_launch_time(sym, category=c) for c in ("linear", "inverse")]
+                fut_lt = min([lt for lt in lt_candidates if lt], default=None)
                 if fut_lt and fut_lt > start:
                     start = fut_lt
-                    _print(f"[{sym}] update start aligned to futures launchTime → {start.isoformat()}")
+                    _print(f"[{sym}] update aligned to futures launchTime → {start.isoformat()}")
 
         _print(f"[{sym}] update 1m from {start.isoformat()} to {end.isoformat()}")
-        rows = fetch_klines_1m(sym, start, end, category=args.category)
-        if not rows:
+        heartbeat = _hb_printer(sym, start, end)
+        rows_acc: list = []
+        for chunk in iter_klines_1m(sym, start, end, category=args.category, on_advance=heartbeat):
+            rows_acc.extend(chunk)
+
+        if not rows_acc:
             _print(f"[{sym}] нет новых баров")
             continue
 
-        df = _df_from_rows(rows)
+        df = _df_from_rows(rows_acc)
         df, n_filled = fill_1m_gaps(df)
         _print(f"[{sym}] заполнено синтетикой минут: {n_filled}")
         validate_1m_index(df)
@@ -208,14 +223,14 @@ def main():
     b.add_argument("--until", required=False, help="ISO дата окончания (UTC)")
     b.add_argument("--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT")
     b.add_argument("--category", required=False, choices=["spot", "linear", "inverse"], default="spot")
-    b.add_argument("--spot-align-futures", action="store_true", help="Для spot: сдвигать since к дате запуска фьючерса (min(linear,inverse))")
+    b.add_argument("--spot-align-futures", action="store_true", help="Для spot: сдвигать окно к дате запуска фьючерса")
     b.set_defaults(func=cmd_backfill)
 
     u = sub.add_parser("update", help="Обновление хвоста 1m до текущего времени - 1 бар")
     u.add_argument("--symbols", required=True)
     u.add_argument("--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT")
     u.add_argument("--category", required=False, choices=["spot", "linear", "inverse"], default="spot")
-    u.add_argument("--spot-align-futures", action="store_true", help="Для spot: сдвигать старт первой догрузки к дате запуска фьючерса")
+    u.add_argument("--spot-align-futures", action="store_true", help="Для spot: сдвигать старт к дате запуска фьючерса")
     u.set_defaults(func=cmd_update)
 
     r = sub.add_parser("resample", help="Ресемплинг из 1m в 5m/15m/1h")
