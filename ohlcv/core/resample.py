@@ -6,8 +6,10 @@
 # - Политика окна: label="right", closed="left" — правая граница агрегата совпадает с правой границей окна.
 # - Агрегации: o=first, h=max, l=min, c=last, v=sum, t=sum, is_gap=max (если есть).
 # - Выход: индекс — правая граница целевого ТФ; порядок столбцов: o,h,l,c,v,(t?),(is_gap?).
+from typing import Dict, Literal
+
 import pandas as pd
-from typing import Literal, Dict
+
 from ..utils.timeframes import tf_to_pandas_rule
 
 

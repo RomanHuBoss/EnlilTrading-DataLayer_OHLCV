@@ -1,20 +1,19 @@
 # ohlcv/cli.py — C1/C2 CLI: backfill/update/resample/report + quality-validate
-import os
-import json
 import argparse
-from pathlib import Path
+import json
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 
-from .api.bybit import iter_klines_1m, get_launch_time
+from .api.bybit import get_launch_time, iter_klines_1m
 from .core.resample import resample_ohlcv
-from .core.validate import validate_1m_index, ensure_missing_threshold, fill_1m_gaps
-from .io.parquet_store import write_idempotent, parquet_path
-from .utils.timeframes import tf_minutes
-from .quality.validator import validate as dq_validate
+from .core.validate import ensure_missing_threshold, fill_1m_gaps, validate_1m_index
+from .io.parquet_store import parquet_path, write_idempotent
 from .quality.validator import QualityConfig
-
+from .quality.validator import validate as dq_validate
+from .utils.timeframes import tf_minutes
 
 # -------------------- общие утилиты --------------------
 

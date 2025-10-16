@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Any, Dict
 
 
 @dataclass(frozen=True)

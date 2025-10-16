@@ -1,9 +1,13 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 import pytest
 
 from ohlcv.core.resample import resample_ohlcv
-from ohlcv.core.validate import validate_1m_index, missing_rate, ensure_missing_threshold
+from ohlcv.core.validate import (
+    ensure_missing_threshold,
+    missing_rate,
+    validate_1m_index,
+)
 
 
 def _mk_df(n: int, start: str = "2024-01-01T00:00:00Z") -> pd.DataFrame:

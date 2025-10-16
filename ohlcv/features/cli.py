@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+
 import pandas as pd
 
-from .core import compute_features, DEFAULTS
+from .core import DEFAULTS, compute_features
 from .utils import BuildMeta
 
 

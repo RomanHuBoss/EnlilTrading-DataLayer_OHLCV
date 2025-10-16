@@ -1,9 +1,10 @@
 # ohlcv/features/core.py
 from __future__ import annotations
 
+from typing import Any, Dict, Tuple
+
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Tuple
 
 from .schema import normalize_and_validate
 

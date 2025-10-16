@@ -1,7 +1,7 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-from ohlcv.quality.validator import validate, QualityConfig, DQ_BITS
+from ohlcv.quality.validator import DQ_BITS, QualityConfig, validate
 
 
 def _mk_1m_index(n, start="2024-01-01T00:00:00Z"):

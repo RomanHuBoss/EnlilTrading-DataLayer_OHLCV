@@ -7,7 +7,8 @@ from .version import __version__
 # Удобные реэкспорты C2 (необязательны, но упрощают импорт в скриптах/тетрадках):
 #   from ohlcv import quality_validate, QualityConfig, DQ_BITS
 try:
-    from .quality import validate as quality_validate, QualityConfig, DQ_BITS  # noqa: F401
+    from .quality import DQ_BITS, QualityConfig
+    from .quality import validate as quality_validate  # noqa: F401
 except Exception:
     # На случай частичных установок без подпакета quality.
     quality_validate = None  # type: ignore

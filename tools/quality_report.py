@@ -1,6 +1,7 @@
 #!/usr/bin/env python
-import sys
 import json
+import sys
+
 import pandas as pd
 
 issues_path = sys.argv[1]
