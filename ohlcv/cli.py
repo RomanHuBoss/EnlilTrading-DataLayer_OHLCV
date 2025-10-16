@@ -18,8 +18,8 @@ from .quality.validator import QualityConfig
 from .quality.validator import validate as dq_validate
 from .utils.timeframes import tf_minutes
 
-
 # -------------------- общие утилиты --------------------
+
 
 def _data_root(arg: str | None) -> Path:
     base = Path(arg) if arg else Path(os.environ.get("C1_DATA_ROOT", Path.cwd() / "data"))
@@ -42,7 +42,9 @@ def _print(msg: str) -> None:
     print(msg, flush=True)
 
 
-def _print_progress(sym: str, fetched: int, total: int, last_ts: datetime, started_at: datetime) -> None:
+def _print_progress(
+    sym: str, fetched: int, total: int, last_ts: datetime, started_at: datetime
+) -> None:
     pct = (fetched / total * 100.0) if total > 0 else 0.0
     elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
     speed = fetched / elapsed if elapsed > 0 else 0.0
@@ -58,7 +60,9 @@ def _hb_printer(sym: str, since: datetime, until: datetime) -> Callable[[int, in
     state: Dict[str, int | None] = {"last_ms": None}
     total_ms = int((until - since).total_seconds() * 1000) or 1
 
-    def _cb(cursor_ms: int, end_ms: int) -> None:  # noqa: ARG001 — сигнатура совместима с вызывающим кодом
+    def _cb(
+        cursor_ms: int, end_ms: int
+    ) -> None:  # noqa: ARG001 — сигнатура совместима с вызывающим кодом
         if state["last_ms"] is None or (cursor_ms - int(state["last_ms"])) >= 6 * 60 * 60 * 1000:
             dt = datetime.fromtimestamp(cursor_ms / 1000, tz=timezone.utc)
             pct = (cursor_ms - int(since.timestamp() * 1000)) / total_ms * 100.0
@@ -86,6 +90,7 @@ def _align_since_with_launch(
 
 
 # -------------------- команды --------------------
+
 
 def cmd_backfill(args: argparse.Namespace) -> None:
     symbols = args.symbols.split(",")
@@ -335,6 +340,7 @@ def cmd_report_missing(args: argparse.Namespace) -> None:
 
 
 # -------------------- точка входа --------------------
+
 
 def main() -> None:
     p = argparse.ArgumentParser(prog="c1-ohlcv")
