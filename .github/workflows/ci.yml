@@ -1,0 +1,41 @@
+name: ci
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -U pip
+      - run: pip install -e .[dev] pytest-cov
+      - run: pytest -q --cov=ohlcv/quality --cov-fail-under=100
+  dq_gate:
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -U pip
+      - run: pip install -e .
+      - name: Check presence of data
+        id: hasdata
+        shell: bash
+        run: |
+          set -e
+          cnt=$(ls -1 data/*/1m.parquet 2>/dev/null | wc -l || true)
+          echo "present=${cnt}" >> "$GITHUB_OUTPUT"
+      - name: Run DQ on repo data
+        if: steps.hasdata.outputs.present != '0'
+        run: |
+          python -m ohlcv.cli quality-validate --symbols BTCUSDT --tf 1m --no-repair --data-root ./data \
+            --issues ./reports/issues.csv --issues-parquet ./reports/issues.parquet \
+            --quality-summary-csv ./reports/quality_summary.csv --quality-summary-json ./reports/quality_summary.json --truncate
+          test ! -s ./reports/issues.csv

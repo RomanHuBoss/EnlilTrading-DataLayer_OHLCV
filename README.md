@@ -1,164 +1,68 @@
-# EnlilTrading · DataLayer_OHLCV
+# DataLayer_OHLCV
 
-Назначение: надёжная загрузка, календаризация, ресемплинг и хранение OHLCV-рядов (C1) + автоматические проверки качества и санитайз (C2). Временная зона — UTC.
+Цель: C1 (DataLayer.OHLCV) и C2 (DataQuality) по постановкам от 2025‑10‑15.
 
-## Состав
+## Возможности
 
-* C1 DataLayer:
+* Загрузка 1m OHLCV с Bybit v5 (spot/linear/inverse), устойчивые ретраи и лимиты.
+* Идемпотентная запись Parquet per (symbol, tf) c метаданными и детерминированным `data_hash`.
+* Ресемплинг из 1m → 5m/15m/1h (`label=right`, `closed=left`).
+* Репарация минутных пропусков (`is_gap`), базовая валидация индекса/календаря.
+* DataQuality: `validate(df) -> (df_clean, issues)`; флаги `dq_flags`, заметки `dq_notes`.
+* CLI: backfill, update, resample, quality-validate, report-missing.
 
-  * Fetcher: Bybit v5 `1m` OHLCV с идемпотентным догрузом.
-  * Calendarize: детерминированное заполнение внутренних «дыр» плоскими минутами с флагом `is_gap`.
-  * Resampler: агрегаты `5m/15m/1h` c прокидыванием `is_gap`.
-  * Хранилище: Parquet (ZSTD), метаданные файла, атомарная перезапись.
-* C2 DataQuality:
+## Установка
 
-  * Валидатор `validate(df) -> (df_clean, issues)`; детерминированные правки безопасных дефектов.
-  * Журнал проблем в CSV; опциональные колонки `dq_flags`, `dq_notes` в данных.
-
-## Зависимости
-
-Python ≥ 3.10. См. `pyproject.toml`.
-
-## Переменные окружения
-
+```bash
+python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -U pip
+pip install -e .[dev]
 ```
-BYBIT_API_KEY=<read-only>
-BYBIT_API_SECRET=<secret>
-C1_DATA_ROOT=./data            # опционально; иначе используется ./data
-C1_BUILD_SIGNATURE=local       # опционально; попадает в метаданные Parquet
+
+Переменные окружения (опционально): `BYBIT_API_KEY`, `BYBIT_API_SECRET`. Каталог данных: `C1_DATA_ROOT` или `./data` по умолчанию.
+
+## CLI
+
+```bash
+# История 1m (UTC)
+python -m ohlcv.cli backfill --symbols BTCUSDT,ETHUSDT --since 2024-01-01 --category spot --spot-align-futures
+
+# Обновление хвоста до «текущее время - 1 бар»
+python -m ohlcv.cli update --symbols BTCUSDT,ETHUSDT --category spot
+
+# Ресемплинг 1m → 1h
+python -m ohlcv.cli resample --symbols BTCUSDT,ETHUSDT --from-tf 1m --to-tf 1h
+
+# Отчёт о пропусках
+python -m ohlcv.cli report-missing --symbols BTCUSDT,ETHUSDT --tf 1m --out ./reports/missing_1m.csv
+
+# DataQuality: валидация и выгрузка артефактов
+python -m ohlcv.cli quality-validate --symbols BTCUSDT,ETHUSDT --tf 1m --write \
+  --issues ./reports/issues.csv --issues-parquet ./reports/issues.parquet \
+  --quality-summary-csv ./reports/quality_summary.csv --quality-summary-json ./reports/quality_summary.json --truncate
 ```
 
 ## Формат данных
 
-Parquet: `data/{SYMBOL}/{TF}.parquet`
+Parquet per `(symbol, tf)`; обязательные колонки: `ts, o, h, l, c, v`; опционально: `t, is_gap, dq_flags, dq_notes`.
+Метаданные в `c1.meta` (JSON): `symbol, tf, source, generated_at, build_signature, data_hash, schema`.
 
-Схема столбцов:
+## Артефакты DoD/NFR
 
-* Обязательные: `ts`, `o`, `h`, `l`, `c`, `v`
-* Опциональные: `t` (turnover), `is_gap` (bool), `dq_flags` (int32), `dq_notes` (str)
+* Parquet: `data/{symbol}/{1m,5m,15m,1h}.parquet`
+* Журнал DQ: `reports/issues.{csv,parquet}`
+* Сводка качества: `reports/quality_summary.{csv,json}`
+* Отчёты пропусков: `reports/missing_{1m,5m,15m,1h}.csv`
+* Логи интеграции: `docs/releases/<DATE>/integration.log`
+* Проверка задержки: `tools/check_latency.py`
 
-Требования:
+## CI
 
-* `ts`: тип `timestamp[ns, UTC]`, правая граница бара (минуты кратны).
-* Индекс при обработке в памяти — `DatetimeIndex` UTC (правая граница).
-* Метаданные файла (в schema metadata):
+* Покрытие для `ohlcv/quality`: 100% (`pytest-cov`).
+* Гейт DQ: падение при наличии дефектов на данных репозитория.
+  Workflow: `.github/workflows/ci.yml`.
 
-  * `source=bybit`
-  * `symbol`, `tf`
-  * `generated_at`, `build_signature`
-  * `data_hash` — стабильный хэш содержимого
+## Спецификации
 
-Компрессия: ZSTD, row group ~256k, словари включены.
-
-## Команды CLI
-
-Модуль: `python -m ohlcv.cli <cmd> ...`
-
-### 1) История 1m (fetch + календаризация + запись)
-
-Спот:
-
-```
-python -m ohlcv.cli backfill --symbols BTCUSDT,ETHUSDT --since 2024-01-01 \
-  --category spot --data-root ./data
-```
-
-Фьючерсы (учёт даты листинга, смещение старта):
-
-```
-python -m ohlcv.cli backfill --symbols BTCUSDT --since 2024-01-01 \
-  --category linear --spot-align-futures --data-root ./data
-```
-
-Поведение:
-
-* Прогресс печатается с оценкой скорости и ETA.
-* Пустые окна сканируются с «heartbeat»-логами.
-* После загрузки: календаризация 1m, валидация индекса, запись Parquet (идемпотентная).
-
-### 2) Догрузка хвоста 1m
-
-```
-python -m ohlcv.cli update --symbols BTCUSDT,ETHUSDT \
-  --category spot --data-root ./data
-```
-
-### 3) Ресемплинг 1m → 5m/15m/1h
-
-```
-python -m ohlcv.cli resample --symbols BTCUSDT --from-tf 1m --to-tf 1h \
-  --data-root ./data
-```
-
-Правила агрегирования:
-
-* Окно: `label="right", closed="left"`
-* `o=first, h=max, l=min, c=last, v=sum, t=sum?`
-* `is_gap=max` (если присутствует)
-
-### 4) Отчёт пропусков
-
-```
-python -m ohlcv.cli report-missing --symbols BTCUSDT,ETHUSDT \
-  --tf 1m --out ./reports/missing.csv --data-root ./data
-```
-
-Выход: CSV со сводными метриками пропусков по символам.
-
-### 5) C2 DataQuality: валидация и санитайз
-
-```
-python -m ohlcv.cli quality-validate --symbols BTCUSDT,ETHUSDT \
-  --tf 1m --write --issues ./reports/issues.csv \
-  --miss-fill-threshold 0.0001 --spike-window 200 --spike-k 12.0 --flat-streak 300 \
-  --data-root ./data
-```
-
-* На выход записывается очищенный Parquet (если `--write`) и журнал `issues.csv` (append).
-* Детерминируемые правки включают:
-
-  * Приведение типов, сортировка, снятие дублей индекса.
-  * Выравнивание таймстампов к границе ТФ при включённой опции валидатора.
-  * Исправление OHLC-инвариантов (h ≥ max(o,c); l ≤ min(o,c); l ≤ h).
-  * Запрет отрицательного объёма (`v<0 → 0`).
-  * Допустимое заполнение пропусков для 1m (плоские свечи, `v=0`) при доле ≤ порога.
-* Журналирует аномалии (скачки цены по MAD, длинные серии `v=0` и т.п.).
-* При наличии — обновляет колонки `dq_flags`, `dq_notes`.
-
-## Структура проекта
-
-```
-ohlcv/
-  api/bybit.py              # REST v5: 1m kline, launchTime, heartbeat
-  core/validate.py          # проверка/календаризация 1m
-  core/resample.py          # ресемплинг 1m → 5m/15m/1h
-  io/parquet_store.py       # запись/слияние Parquet, метаданные
-  utils/timeframes.py       # мэппинг таймфреймов
-  cli.py                    # команды C1/C2
-  quality/                  # C2 (будет добавлено в составе файлами issues.py, validator.py)
-tests/
-  test_resample.py
-  test_store.py
-docs/
-  howto.md
-```
-
-## Ограничения и NFR
-
-* Доля пропусков после календаризации < 0.01% внутри диапазона файла.
-* Валидность таймстампов (UTC, кратны минуте).
-* Задержка обновления ≤ 1 бар.
-* Идемпотентная догрузка истории.
-
-## Примеры путей
-
-```
-./data/BTCUSDT/1m.parquet
-./data/BTCUSDT/5m.parquet
-./reports/missing.csv
-./reports/issues.csv
-```
-
-## Лицензия
-
-MIT
+* [C1 Data Layer](docs/specs/C1-Data%20Layer.pdf)
+* [C2 Data Quality](docs/specs/C2-Data%20Quality.pdf)

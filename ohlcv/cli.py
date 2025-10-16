@@ -1,5 +1,6 @@
 # ohlcv/cli.py — C1/C2 CLI: backfill/update/resample/report + quality-validate
 import os
+import json
 import argparse
 from pathlib import Path
 from datetime import datetime, timezone
@@ -191,7 +192,7 @@ def cmd_quality_validate(args):
     data_root = _data_root(args.data_root)
     symbols = args.symbols.split(",")
     tf = args.tf
-    _print(f"[cfg] data_root={str(data_root)}; tf={tf}; write={args.write}; issues={args.issues}")
+    _print(f"[cfg] data_root={str(data_root)}; tf={tf}; write={args.write}; issues_csv={args.issues}; issues_parquet={args.issues_parquet}")
 
     cfg = QualityConfig(
         missing_fill_threshold=args.miss_fill_threshold,
@@ -199,6 +200,9 @@ def cmd_quality_validate(args):
         spike_k=args.spike_k,
         flat_streak_threshold=args.flat_streak,
     )
+
+    summary_rows = []
+    all_issues = []
 
     for sym in symbols:
         src = parquet_path(data_root, sym, tf)
@@ -213,13 +217,9 @@ def cmd_quality_validate(args):
 
         clean, issues = dq_validate(df, tf=tf, symbol=sym, repair=not args.no_repair, config=cfg)
 
-        if args.issues:
-            out_issues = Path(args.issues).expanduser().resolve()
-            out_issues.parent.mkdir(parents=True, exist_ok=True)
-            mode = "a" if out_issues.exists() else "w"
-            header = not out_issues.exists()
-            issues.assign(symbol=sym, tf=tf).to_csv(out_issues, mode=mode, header=header, index=False)
-            _print(f"[{sym}] issues → {out_issues}")
+        if not issues.empty:
+            issues = issues.assign(symbol=sym, tf=tf)
+            all_issues.append(issues)
 
         if args.write:
             out_path = write_idempotent(data_root, sym, tf, clean)
@@ -227,8 +227,53 @@ def cmd_quality_validate(args):
 
         total = len(df)
         total_clean = len(clean)
-        n_issues = len(issues)
+        n_issues = 0 if issues is None else len(issues)
         _print(f"[{sym}] summary: rows_in={total} rows_out={total_clean} issues={n_issues}")
+
+        summary_rows.append({
+            "symbol": sym, "tf": tf,
+            "rows_in": total, "rows_out": total_clean, "issues": n_issues
+        })
+
+    # Внешние артефакты (C2): issues.{csv,parquet} и quality_summary.{csv,json}
+    if all_issues:
+        issues_cat = pd.concat(all_issues, axis=0, ignore_index=True)
+        if args.issues:
+            out_issues_csv = Path(args.issues).expanduser().resolve()
+            out_issues_csv.parent.mkdir(parents=True, exist_ok=True)
+            mode = "a" if (out_issues_csv.exists() and not args.truncate) else "w"
+            header = not out_issues_csv.exists() or args.truncate
+            issues_cat.to_csv(out_issues_csv, index=False, mode=mode, header=header)
+            _print(f"[issues] csv → {out_issues_csv}")
+        if args.issues_parquet:
+            out_issues_parquet = Path(args.issues_parquet).expanduser().resolve()
+            out_issues_parquet.parent.mkdir(parents=True, exist_ok=True)
+            # всегда перезаписываем parquet детерминированно
+            issues_cat.to_parquet(out_issues_parquet, index=False)
+            _print(f"[issues] parquet → {out_issues_parquet}")
+
+    if summary_rows:
+        summary_df = pd.DataFrame(summary_rows)
+        if args.quality_summary_csv:
+            out_csv = Path(args.quality_summary_csv).expanduser().resolve()
+            out_csv.parent.mkdir(parents=True, exist_ok=True)
+            mode = "a" if (out_csv.exists() and not args.truncate) else "w"
+            header = not out_csv.exists() or args.truncate
+            summary_df.to_csv(out_csv, index=False, mode=mode, header=header)
+            _print(f"[summary] csv → {out_csv}")
+        if args.quality_summary_json:
+            out_json = Path(args.quality_summary_json).expanduser().resolve()
+            out_json.parent.mkdir(parents=True, exist_ok=True)
+            obj = {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "by_symbol": summary_df.groupby("symbol")["issues"].sum().to_dict(),
+                "total_issues": int(summary_df["issues"].sum()),
+                "rows_in": int(summary_df["rows_in"].sum()),
+                "rows_out": int(summary_df["rows_out"].sum()),
+            }
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+            _print(f"[summary] json → {out_json}")
 
 
 def cmd_report_missing(args):
@@ -299,7 +344,11 @@ def main():
     q.add_argument("--tf", required=True, choices=["1m", "5m", "15m", "1h"])
     q.add_argument("--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT")
     q.add_argument("--write", action="store_true", help="Перезаписать очищенный файл Parquet")
-    q.add_argument("--issues", required=False, help="Путь для CSV-журнала проблем; если файл существует — дописывать")
+    q.add_argument("--issues", required=False, help="Путь для CSV-журнала проблем; append по умолчанию")
+    q.add_argument("--issues-parquet", required=False, help="Путь для Parquet-журнала проблем; перезапись")
+    q.add_argument("--quality-summary-csv", required=False, help="Путь для сводного CSV по качеству; append по умолчанию")
+    q.add_argument("--quality-summary-json", required=False, help="Путь для сводного JSON по качеству; перезапись")
+    q.add_argument("--truncate", action="store_true", help="Сначала очистить целевые CSV перед записью")
     q.add_argument("--no-repair", action="store_true", help="Только диагностировать, без автоправок")
     q.add_argument("--miss-fill-threshold", type=float, default=0.0001, help="Порог заполнения пропусков для 1m")
     q.add_argument("--spike-window", type=int, default=200, help="Окно MAD-детектора всплесков")
