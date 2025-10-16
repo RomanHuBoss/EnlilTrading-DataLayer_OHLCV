@@ -1,0 +1,10 @@
+rv_windows: [20, 60]
+ema_windows: [20]
+mom_windows: [20]
+rsi_period: 14
+adx_period: 14
+atr_period: 14
+donch_window: 20
+z_windows: [20, 60]
+vwap_roll_window: 96
+vol_windows: [20]

@@ -19,7 +19,7 @@ classifiers = [
 # Минимальный набор зависимостей; tenacity удалён как неиспользуемый
 dependencies = [
   "numpy>=1.26",
-  "pandas>=2.1",
+  "pandas>=2.2",
   "pyarrow>=15",
   "requests>=2.31",
   "filelock>=3.12",
@@ -36,6 +36,7 @@ dev = [
 
 [project.scripts]
 c1-ohlcv = "ohlcv.cli:main"
+features-core = "ohlcv.features.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
