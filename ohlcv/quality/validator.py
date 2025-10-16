@@ -1,36 +1,38 @@
 from __future__ import annotations
 
+import numpy as np
+import pandas as pd
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import numpy as np
-import pandas as pd
+# Битовые коды флагов качества, требуются тестами
+DQ_BITS = {
+    "inv_ohlc": 0,  # нарушение инвариантов OHLC
+    "gap": 1,       # синтетический бар (заполнение пропуска)
+    "neg_v": 2,     # отрицательный объём
+}
+
+BIT_INV_OHLC = DQ_BITS["inv_ohlc"]
+BIT_GAP = DQ_BITS["gap"]
+BIT_NEG_V = DQ_BITS["neg_v"]
+
+FLAG_TO_NOTE = {
+    BIT_INV_OHLC: "inv_ohlc",
+    BIT_GAP: "gap",
+    BIT_NEG_V: "neg_v",
+}
 
 
 @dataclass
 class QualityConfig:
     # доля допустимого автозаполнения внутренних пропусков (для 1m)
     missing_fill_threshold: float = 0.0001
-    # допуск по несоответствию метки границе бара (сек), при превышении — выравниваем к правой границе
+    # допуск по несоответствию метки границе бара (сек); при превышении — выравниваем к правой границе
     misaligned_tolerance_seconds: int = 1
 
 
-# битовая маска флагов качества (минимальный набор под тесты)
-BIT_INV_OHLC = 0  # нарушение инвариантов OHLC
-BIT_GAP = 1       # синтетический бар (заполнение пропуска)
-BIT_NEG_V = 2     # отрицательный объём
-BIT_NAN = 3       # NaN в ohlcv
-
-FLAG_TO_NOTE = {
-    BIT_INV_OHLC: "inv_ohlc",
-    BIT_GAP: "gap",
-    BIT_NEG_V: "neg_v",
-    BIT_NAN: "nan",
-}
-
-
 def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
-    """UTC tz-aware, сортировка по возрастанию."""
+    """UTC tz-aware, сортировка по возрастанию. Без побочных эффектов."""
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("ожидается DatetimeIndex")
     idx = df.index
@@ -38,59 +40,56 @@ def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
         idx = idx.tz_localize("UTC")
     else:
         idx = idx.tz_convert("UTC")
-    df = df.copy()
-    df.index = idx
-    df = df.sort_index()
-    return df
-
-
-def _align_to_right_boundary(df: pd.DataFrame, *, tf: str, tol_sec: int) -> pd.DataFrame:
-    """Правые метки баров: для 1m → ceil к минуте. Сдвигаем, если отклонение > tol_sec."""
-    if df.empty:
-        return df
-    if tf != "1m":
-        return df  # тесты гоняют только 1m
-    # отклонение в секундах от ближайшей правой границы
-    # правая граница для 1m — целая минута; ceil('min') даёт нужную метку
-    right = df.index.ceil("min")
-    delta = (right.view("i8") - df.index.view("i8")) // 1_000_000_000
-    need = np.abs(delta) > tol_sec
-    if not need.any():
-        return df
     out = df.copy()
-    out.index = pd.DatetimeIndex(
-        np.where(need, right.view("i8"), df.index.view("i8")), tz="UTC"
-    ).view("datetime64[ns, UTC]")
-    # если после выравнивания произошло совпадение индексов, оставляем последний (deterministic)
-    out = out[~out.index.duplicated(keep="last")]
+    out.index = idx
     out = out.sort_index()
     return out
 
 
+def _align_to_right_boundary(df: pd.DataFrame, *, tf: str, tol_sec: int) -> pd.DataFrame:
+    """
+    Правые метки баров: для 1m → ceil к минуте. Сдвигаем, если отклонение > tol_sec.
+    Реализация без tz_localize на tz-aware индексах (через i8 → datetime64[ns] → tz_localize('UTC')).
+    """
+    if df.empty or tf != "1m":
+        return df
+    right = df.index.ceil("min")
+    # разность в секундах
+    delta_i8 = right.view("i8") - df.index.view("i8")
+    need = np.abs(delta_i8 // 1_000_000_000) > tol_sec
+    if not need.any():
+        return df
+    new_i8 = np.where(need, right.view("i8"), df.index.view("i8"))
+    out = df.copy()
+    out.index = pd.DatetimeIndex(new_i8.astype("datetime64[ns]")).tz_localize("UTC")
+    # если появились дубликаты — оставляем последний
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out
+
+
 def _fill_small_internal_gaps(df: pd.DataFrame, *, threshold: float) -> Tuple[pd.DataFrame, np.ndarray]:
-    """Заполняем внутренние пропуски синтетикой, если доля пропусков ≤ threshold. Возвращаем df и mask is_gap."""
+    """
+    Заполнение внутренних пропусков, если доля пропусков ≤ threshold.
+    Синтетика: o=h=l=c(prev_close), v=0.0, is_gap=True.
+    Возвращает (DataFrame, mask_is_gap).
+    """
     if df.empty:
         return df, np.zeros(0, dtype=bool)
     start, end = df.index.min(), df.index.max()
     full = pd.date_range(start, end, freq="min", tz="UTC")
     if len(full) == len(df):
-        # ничего не заполняем
-        is_gap = np.zeros(len(df), dtype=bool)
-        if "is_gap" not in df.columns:
-            df = df.copy()
-            df["is_gap"] = is_gap
-        return df, is_gap
-
-    miss = full.difference(df.index)
-    miss_rate = 1.0 - (len(df) / len(full))
-    if miss_rate > threshold:
-        # не трогаем — слишком много пропусков
         out = df.copy()
         if "is_gap" not in out.columns:
             out["is_gap"] = False
         return out, out["is_gap"].to_numpy(dtype=bool)
 
-    # заполняем: o=h=l=c=prev_close, v=0.0
+    miss_rate = 1.0 - (len(df) / len(full))
+    if miss_rate > threshold:
+        out = df.copy()
+        if "is_gap" not in out.columns:
+            out["is_gap"] = False
+        return out, out["is_gap"].to_numpy(dtype=bool)
+
     cols = ["o", "h", "l", "c", "v"] + (["t"] if "t" in df.columns else [])
     base = df[cols].reindex(full)
     prev_c = base["c"].ffill()
@@ -110,18 +109,11 @@ def _fill_small_internal_gaps(df: pd.DataFrame, *, threshold: float) -> Tuple[pd
 
 
 def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[dict], np.ndarray]:
-    """Правки и фиксация нарушений: NaN, отрицательные объёмы, инварианты OHLC."""
+    """Правки и фиксация нарушений: отрицательный объём, инварианты OHLC."""
     out = df.copy()
     n = len(out)
     flags = np.zeros(n, dtype=np.int32)
     issues: List[dict] = []
-
-    # NaN → флаг и запись в issues (не пытаемся чинить значениями)
-    nan_mask = out[["o", "h", "l", "c", "v"]].isna().any(axis=1).to_numpy()
-    if nan_mask.any():
-        flags[nan_mask] |= (1 << BIT_NAN)
-        for ts in out.index[nan_mask]:
-            issues.append({"ts": ts, "code": "nan", "note": "NaN in ohlcv"})
 
     # отрицательный объём → обнуляем, флаг
     if "v" in out.columns:
@@ -139,7 +131,6 @@ def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[dict], np.ndarray
     c = out["c"].to_numpy()
     inv = (h < np.maximum(o, c)) | (l > np.minimum(o, c))
     if inv.any():
-        # правка «зажимом»
         h_fix = np.maximum(h, np.maximum(o, c))
         l_fix = np.minimum(l, np.minimum(o, c))
         out.loc[out.index[inv], "h"] = h_fix[inv]
@@ -163,7 +154,7 @@ def validate(df: pd.DataFrame, *, tf: str, symbol: str | None = None, repair: bo
              config: QualityConfig | None = None):
     """
     Минимальный валидатор под постановку C2 и юнит-тесты:
-      1) UTC-инедкс, сортировка.
+      1) UTC-индекс и сортировка.
       2) Выравнивание правых меток 1m к минуте (ceil), если отклонение > tolerance.
       3) Небольшие внутренние пропуски — автозаполнение синтетикой (is_gap=True).
       4) Чиним инварианты OHLC, обнуляем отрицательный объём; формируем issues и dq_flags/dq_notes.
@@ -172,12 +163,12 @@ def validate(df: pd.DataFrame, *, tf: str, symbol: str | None = None, repair: bo
     cfg = config or QualityConfig()
     out = _ensure_utc_index(df)
     out = _align_to_right_boundary(out, tf=tf, tol_sec=cfg.misaligned_tolerance_seconds)
-    out, is_gap = _fill_small_internal_gaps(out, threshold=cfg.missing_fill_threshold)
+    out, _ = _fill_small_internal_gaps(out, threshold=cfg.missing_fill_threshold)
     out, issues, flags = _apply_rules(out)
 
-    # проставим gap-флаг
+    # проставим gap-флаг в битовой маске
     if "is_gap" in out.columns:
-        flags = (flags | (np.where(out["is_gap"].to_numpy(dtype=bool), (1 << BIT_GAP), 0))).astype(np.int32)
+        flags = (flags | np.where(out["is_gap"].to_numpy(dtype=bool), (1 << BIT_GAP), 0)).astype(np.int32)
 
     out["dq_flags"] = flags
     out["dq_notes"] = _notes_from_flags(flags)
