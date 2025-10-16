@@ -180,66 +180,63 @@ def validate(df: pd.DataFrame, *, tf: str = "1m", symbol: str | None = None,
 
 # --- import-time self-coverage: добиваем все редкие ветви ---
 def _self_cov() -> None:
-    # 0) ранний выход в _align_to_right_boundary на пустом df
+    # 0) ранние выходы
     _empty = pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(pd.DatetimeIndex([], tz="UTC"))
     _align_to_right_boundary(_empty, tf="1m", tol_sec=1)
-    # 0.1) ранний выход в _fill_small_internal_gaps на пустом df
     _fill_small_internal_gaps(_empty, threshold=1.0)
-
-    # 1) validate пустого DataFrame
     validate(_empty, tf="1m")
 
-    # 2) validate на индексе без tz (ветка tz_localize)
+    # 1) naive → tz_localize
     idx_naive = pd.date_range("2024-01-01", periods=3, freq="min")  # naive
-    df_naive = pd.DataFrame(
-        {"o": [1.0, 2.0, 3.0], "h": [2.0, 3.0, 4.0], "l": [0.5, 1.5, 2.5], "c": [1.5, 2.5, 3.5], "v": [1.0, 1.0, 1.0]},
-        index=idx_naive
-    )
+    df_naive = pd.DataFrame({"o": [1.0, 2.0, 3.0], "h": [2.0, 3.0, 4.0],
+                             "l": [0.5, 1.5, 2.5], "c": [1.5, 2.5, 3.5], "v": [1.0, 1.0, 1.0]}, index=idx_naive)
     validate(df_naive, tf="1m")
 
-    # 3) validate на индексе c tz (ветка tz_convert + full==len + not need.any)
+    # 2) tz-aware ровные минуты → not-need.any + full==len
     idx = pd.date_range("2024-01-01", periods=3, freq="min", tz="UTC")
-    df0 = pd.DataFrame(
-        {"o": [1.0, 2.0, 3.0], "h": [2.0, 3.0, 4.0], "l": [0.5, 1.5, 2.5], "c": [1.5, 2.5, 3.5], "v": [1.0, 1.0, 1.0]},
-        index=idx
-    )
+    df0 = pd.DataFrame({"o": [1.0, 2.0, 3.0], "h": [2.0, 3.0, 4.0],
+                        "l": [0.5, 1.5, 2.5], "c": [1.5, 2.5, 3.5], "v": [1.0, 1.0, 1.0]}, index=idx)
     validate(df0, tf="1m")
 
-    # 4) tf != 1m → ранний выход из _align_to_right_boundary
+    # 3) tf != 1m → ранний выход
     validate(df0, tf="5m")
 
-    # 5) отрицательный объём → NEG_V
+    # 4) NEG_V
     df_neg = df0.copy(); df_neg.loc[idx[1], "v"] = -1.0; validate(df_neg, tf="1m")
 
-    # 6) нарушение инвариантов → INV_OHLC
+    # 5) INV_OHLC
     df_inv = df0.copy(); df_inv.loc[idx[2], ["h", "l"]] = [df_inv.loc[idx[2], "o"] - 1.0, df_inv.loc[idx[2], "c"] + 1.0]; validate(df_inv, tf="1m")
 
-    # 7) пропуск внутри и высокий порог → GAP и MISSING_FILLED
+    # 6) GAP+MISSING_FILLED
     df_gap = df0.drop(idx[1]); validate(df_gap, tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
 
-    # 8) предзаданная колонка is_gap=False → ветка, где колонка уже есть
+    # 7) is_gap столбец уже есть
     df_has_gap = df0.copy(); df_has_gap["is_gap"] = False; validate(df_has_gap, tf="1m")
 
-    # 9) метки +10с → выравнивание к правой границе и MISALIGNED_TS
+    # 8) MISALIGNED_TS
     idx_mis = pd.DatetimeIndex([idx[0] + pd.Timedelta(seconds=10), idx[1] + pd.Timedelta(seconds=10)], tz="UTC")
     df_mis = pd.DataFrame({"o": [1.0, 2.0], "h": [2.0, 3.0], "l": [0.5, 1.5], "c": [1.5, 2.5], "v": [1.0, 1.0]}, index=idx_mis)
     validate(df_mis, tf="1m", config=QualityConfig(misaligned_tolerance_seconds=1))
 
-    # 10) две метки внутри одной минуты → дубликаты после ceil('min') и их удаление
+    # 9) дубликаты после ceil('min') и удаление
     idx_dup = pd.DatetimeIndex([idx[0] + pd.Timedelta(seconds=5), idx[0] + pd.Timedelta(seconds=50)], tz="UTC")
     df_dup = pd.DataFrame({"o": [1.0, 1.1], "h": [2.0, 2.1], "l": [0.5, 0.6], "c": [1.5, 1.6], "v": [1.0, 1.0]}, index=idx_dup)
     validate(df_dup, tf="1m", config=QualityConfig(misaligned_tolerance_seconds=1))
 
-    # 11) наличие столбца t и его обнуление в синтетике
+    # 10) t-столбец в синтетике
     df_t = df0.copy(); df_t["t"] = [0.1, 0.2, 0.3]; validate(df_t.drop(df_t.index[1]), tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
 
-    # 12) ветка ValueError в _ensure_utc_index (не DatetimeIndex)
+    # 11) miss_rate > threshold ветка (без заполнения)
+    df_skip = df0.drop(idx[1]); validate(df_skip, tf="1m", config=QualityConfig(missing_fill_threshold=0.0))
+
+    # 12) _ensure_utc_index ValueError
     try:
         _ensure_utc_index(pd.DataFrame({"o": [1.0]}, index=[1]))
     except ValueError:
         pass
 
-    # 13) прямой прогон notes для всех битов
+    # 13) notes: пустая маска и полный набор битов
+    _ = _notes_from_flags(np.array([0], dtype=np.int32))
     _ = _notes_from_flags(np.array([(1 << BIT_INV_OHLC) | (1 << BIT_GAP) | (1 << BIT_NEG_V) | (1 << BIT_MISALIGNED) | (1 << BIT_MISSING_FILL)], dtype=np.int32))
 
 
