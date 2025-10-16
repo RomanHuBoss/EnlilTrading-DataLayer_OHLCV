@@ -15,6 +15,63 @@ USER_AGENT = "EnlilTrading-DataLayer/1.0 (python-requests)"
 # Ограничения Bybit: limit<=1000, интервал 1m передаётся как "1"
 KLINE_LIMIT = 1000
 
+# Коды Bybit, требующие паузы/повтора
+RATE_LIMIT_CODES = {"10006"}  # Too many visits. Exceeded the API Rate Limit.
+
+
+def _parse_retry_after_seconds(resp: requests.Response) -> Optional[float]:
+    """
+    Извлекает рекомендуемую паузу из заголовков/тела ответа, если доступно.
+    Поддерживаемые источники:
+      - Retry-After (секунды)
+      - X-RateLimit-Reset, X-Rate-Limit-Reset (unix/мс → вычисление дельты)
+      - X-Bapi-Limit-Reset-Timestamp, X-Bapi-Rate-Limit-Reset-Timestamp (мс)
+    Если ничего нет — None.
+    """
+    h = resp.headers or {}
+    # 1) Retry-After: целые секунды
+    for k in ("Retry-After", "retry-after"):
+        if k in h:
+            try:
+                return float(h[k])
+            except Exception:
+                pass
+    # 2) Разные варианты "reset" таймштампов
+    now = time.time()
+    for k in (
+        "X-RateLimit-Reset",
+        "X-Rate-Limit-Reset",
+        "X-Bapi-Limit-Reset-Timestamp",
+        "X-Bapi-Rate-Limit-Reset-Timestamp",
+    ):
+        if k in h:
+            val = h[k]
+            try:
+                # бывают секунды или миллисекунды; нормализуем
+                ts = float(val)
+                if ts > 10_000_000_000:  # вероятно мс
+                    ts /= 1000.0
+                wait = max(0.0, ts - now)
+                if wait > 0:
+                    return wait
+            except Exception:
+                pass
+    # 3) Попробуем retExtInfo из JSON (если уже парсили вне)
+    try:
+        data = resp.json()
+        ext = data.get("retExtInfo") or {}
+        for k in ("retryAfter", "waitSec", "nextValidTimestamp"):
+            if k in ext:
+                v = float(ext[k])
+                if v > 10_000_000_000:
+                    v /= 1000.0
+                if k == "nextValidTimestamp":
+                    return max(0.0, v - time.time())
+                return max(0.0, v)
+    except Exception:
+        pass
+    return None
+
 
 def _http_get(
     path: str,
@@ -22,15 +79,24 @@ def _http_get(
     headers: Optional[Dict[str, str]] = None,
     *,
     timeout: int = 20,
-    max_retries: int = 5,
-    backoff_base: float = 0.8,
+    max_retries: int = 10,
+    backoff_base: float = 0.4,
 ) -> requests.Response:
+    """
+    GET с устойчивостью к 5xx, 429 и retCode=10006 (лимит).
+    Поведение:
+      - 5xx → экспоненциальный ретрай.
+      - 429/10006 → пауза по Retry-After/Reset, иначе экспоненциальная.
+      - Прочие 2xx возвращаются вызывающему коду.
+    """
     url = f"{BASE_URL}{path}"
     h = {"User-Agent": USER_AGENT}
     if headers:
         h.update(headers)
 
-    last_err = None
+    last_err: Optional[Exception] = None
+    sleep = backoff_base
+
     for attempt in range(max_retries + 1):
         try:
             r = requests.get(
@@ -39,14 +105,38 @@ def _http_get(
                 headers=h,
                 timeout=timeout,
             )
+            # 5xx → ретрай
             if r.status_code >= 500:
                 raise requests.HTTPError(f"{r.status_code} {r.text[:200]}")
+            # 429 → подождать и повторить
+            if r.status_code == 429:
+                wait = _parse_retry_after_seconds(r) or sleep
+                time.sleep(wait)
+                sleep = min(sleep * 2, 8.0)
+                continue
+
+            # 2xx → проверим лимит в теле
+            try:
+                data = r.json()
+                rc = str(data.get("retCode"))
+                if rc in RATE_LIMIT_CODES:
+                    wait = _parse_retry_after_seconds(r) or sleep
+                    time.sleep(wait)
+                    sleep = min(sleep * 2, 8.0)
+                    continue  # повторить запрос
+            except Exception:
+                # тело не JSON — отдадим наверх, пусть обработает вызывающий
+                pass
+
             return r
+
         except Exception as e:
             last_err = e
             if attempt >= max_retries:
                 break
-            time.sleep(backoff_base * (2 ** attempt))
+            time.sleep(sleep)
+            sleep = min(sleep * 2, 8.0)
+
     if isinstance(last_err, Exception):
         raise last_err
     raise RuntimeError("HTTP GET failed with unknown error")
@@ -85,11 +175,12 @@ def iter_klines_1m(
     on_advance: Optional[Callable[[int, int], None]] = None,
     timeout: int = 20,
     max_retries: int = 5,
-    sleep_sec: float = 0.2,
+    sleep_sec: float = 0.25,
 ) -> Generator[List[Dict[str, float]], None, None]:
     """
     Генератор чанков 1m баров. Пагинация за счёт сдвига параметра `end` к началу окна.
     API отдаёт список в обратном порядке (по убыванию startTime), забираем по 1000 и двигаем end.
+    Устойчив к лимитам (429/10006) через _http_get.
     """
     if since.tzinfo is None:
         since = since.replace(tzinfo=timezone.utc)
@@ -117,9 +208,10 @@ def iter_klines_1m(
         params["start"] = start_ms
         params["end"] = window_end
 
-        r = _http_get(path, params, timeout=timeout, max_retries=max_retries, backoff_base=sleep_sec)
+        r = _http_get(path, params, timeout=timeout, max_retries=10, backoff_base=max(sleep_sec, 0.25))
         data = r.json()
         if str(data.get("retCode")) != "0":
+            # сюда попадают нефатальные коды, которые _http_get не распознал как rate-limit/429
             raise RuntimeError(f"Bybit error: {data.get('retCode')} {data.get('retMsg')}")
         result = data.get("result") or {}
         lst = result.get("list") or []
