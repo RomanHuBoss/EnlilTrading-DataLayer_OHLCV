@@ -65,7 +65,6 @@ def _rows_from_kline_list(lst: List[List[str]]) -> List[Dict[str, float]]:
         v = float(it[5])
         ts_iso = _iso_from_ms(start_ms + 60_000)  # правая граница
         row: Dict[str, float] = {"ts": ts_iso, "o": o, "h": h, "l": l, "c": c, "v": v}
-        # turnover (опционально)
         if len(it) > 6:
             try:
                 row["t"] = float(it[6])
@@ -89,9 +88,8 @@ def iter_klines_1m(
     sleep_sec: float = 0.2,
 ) -> Generator[List[Dict[str, float]], None, None]:
     """
-    Генератор чанков 1m баров по v5 с поддержкой nextPageCursor.
-    Вход: [since, until], категории: spot|linear|inverse.
-    Возвращает чанки по <=1000 баров (список словарей с ISO ts).
+    Генератор чанков 1m баров. Пагинация за счёт сдвига параметра `end` к началу окна.
+    API отдаёт список в обратном порядке (по убыванию startTime), забираем по 1000 и двигаем end.
     """
     if since.tzinfo is None:
         since = since.replace(tzinfo=timezone.utc)
@@ -101,59 +99,56 @@ def iter_klines_1m(
         return
 
     start_ms = int(since.timestamp() * 1000)
-    end_ms = int(until.timestamp() * 1000)
+    end_ms_initial = int(until.timestamp() * 1000)
 
     path = "/v5/market/kline"
-    # Первичный запрос задаёт окно, далее пагинация идёт через cursor (направление определяет сервер)
-    params = {
+    params_base = {
         "category": category,
         "symbol": symbol,
         "interval": "1",
-        "start": start_ms,
-        "end": end_ms,
         "limit": KLINE_LIMIT,
     }
 
-    cursor: Optional[str] = None
-    seen_any = False
+    window_end = end_ms_initial
+    step_ms = KLINE_LIMIT * 60_000
 
-    while True:
-        eff = dict(params)
-        if cursor:
-            # По спецификации v5 при наличии cursor он имеет приоритет для пагинации.
-            eff["cursor"] = cursor
-        r = _http_get(path, eff, timeout=timeout, max_retries=max_retries, backoff_base=sleep_sec)
+    while window_end > start_ms:
+        params = dict(params_base)
+        params["start"] = start_ms
+        params["end"] = window_end
+
+        r = _http_get(path, params, timeout=timeout, max_retries=max_retries, backoff_base=sleep_sec)
         data = r.json()
         if str(data.get("retCode")) != "0":
             raise RuntimeError(f"Bybit error: {data.get('retCode')} {data.get('retMsg')}")
         result = data.get("result") or {}
         lst = result.get("list") or []
-        cursor = result.get("nextPageCursor") or None
 
         if not lst:
-            # Нет данных или достигнут край диапазона
-            break
+            # Пустое окно: сдвиг назад фиксированным шагом
+            new_end = max(start_ms, window_end - step_ms)
+            if new_end == window_end:
+                break
+            window_end = new_end
+            if on_advance:
+                on_advance(window_end, end_ms_initial)
+            time.sleep(sleep_sec)
+            continue
 
-        # Bybit может возвращать list в обратном порядке; нормализуем по возрастанию start_ms
+        # Отсортируем по возрастанию для корректного построения временного ряда
         lst_sorted = sorted(lst, key=lambda x: int(x[0]))
         rows = _rows_from_kline_list(lst_sorted)
-        seen_any = True
         yield rows
 
-        # Heartbeat: продвигаем «сканирование» по максимальной метке чанка
-        if on_advance:
-            last_start_ms = int(lst_sorted[-1][0])
-            on_advance(last_start_ms + 60_000, end_ms)
-
-        # Если курсора нет — окончен диапазон
-        if not cursor:
+        # Новый конец окна — самая ранняя startTime текущего чанка минус 60 секунд
+        earliest_start_ms = int(lst_sorted[0][0])
+        if earliest_start_ms <= start_ms:
             break
+        window_end = earliest_start_ms - 60_000
 
+        if on_advance:
+            on_advance(window_end, end_ms_initial)
         time.sleep(sleep_sec)
-
-    # Пустой диапазон, но двинем heartbeat к since, чтобы было видно завершение сканирования
-    if (not seen_any) and on_advance:
-        on_advance(start_ms, end_ms)
 
 
 def fetch_klines_1m(
