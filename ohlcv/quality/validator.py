@@ -7,35 +7,35 @@ from typing import List, Tuple
 
 # Битовые коды флагов качества (совместимо с тестами: допускаются синонимы)
 DQ_BITS = {
-    "INV_OHLC": 0,       "inv_ohlc": 0,
-    "MISSING_BARS": 1,   "gap": 1,
-    "NEG_V": 2,          "neg_v": 2,
-    "MISALIGNED_TS": 3,  "misaligned_ts": 3,
+    "INV_OHLC": 0,         "inv_ohlc": 0,
+    "MISSING_BARS": 1,     "gap": 1,
+    "NEG_V": 2,            "neg_v": 2,
+    "MISALIGNED_TS": 3,    "misaligned_ts": 3,
+    "MISSING_FILLED": 4,   "missing_filled": 4,
 }
 
-BIT_INV_OHLC   = DQ_BITS["INV_OHLC"]
-BIT_GAP        = DQ_BITS["MISSING_BARS"]
-BIT_NEG_V      = DQ_BITS["NEG_V"]
-BIT_MISALIGNED = DQ_BITS["MISALIGNED_TS"]
+BIT_INV_OHLC     = DQ_BITS["INV_OHLC"]
+BIT_GAP          = DQ_BITS["MISSING_BARS"]
+BIT_NEG_V        = DQ_BITS["NEG_V"]
+BIT_MISALIGNED   = DQ_BITS["MISALIGNED_TS"]
+BIT_MISSING_FILL = DQ_BITS["MISSING_FILLED"]
 
 FLAG_TO_NOTE = {
-    BIT_INV_OHLC:   "inv_ohlc",
-    BIT_GAP:        "gap",
-    BIT_NEG_V:      "neg_v",
-    BIT_MISALIGNED: "misaligned_ts",
+    BIT_INV_OHLC:     "inv_ohlc",
+    BIT_GAP:          "gap",
+    BIT_NEG_V:        "neg_v",
+    BIT_MISALIGNED:   "misaligned_ts",
+    BIT_MISSING_FILL: "missing_filled",
 }
 
 
 @dataclass
 class QualityConfig:
-    # доля допустимого автозаполнения внутренних пропусков (для 1m)
     missing_fill_threshold: float = 0.0001
-    # допуск по несоответствию метки границе бара (сек); при превышении — выравниваем к правой границе
     misaligned_tolerance_seconds: int = 1
 
 
 def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
-    """UTC tz-aware, сортировка по возрастанию. Без побочных эффектов."""
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("ожидается DatetimeIndex")
     idx = df.index
@@ -50,11 +50,6 @@ def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _align_to_right_boundary(df: pd.DataFrame, *, tf: str, tol_sec: int) -> Tuple[pd.DataFrame, np.ndarray]:
-    """
-    Правые метки баров: для 1m → ceil к минуте. Сдвигаем, если отклонение > tol_sec.
-    Возвращает (DataFrame, mask_aligned) — какие строки были выровнены.
-    Реализация без tz_localize на уже tz-aware индексах.
-    """
     if df.empty or tf != "1m":
         return df, np.zeros(len(df), dtype=bool)
     right = df.index.ceil("min")
@@ -66,17 +61,14 @@ def _align_to_right_boundary(df: pd.DataFrame, *, tf: str, tol_sec: int) -> Tupl
     out = df.copy()
     out.index = pd.DatetimeIndex(new_i8.astype("datetime64[ns]")).tz_localize("UTC")
     out = out[~out.index.duplicated(keep="last")].sort_index()
-    # reindex need mask к новому порядку индекса: ставим True для тех ts, что были в исходном need
-    # проще — восстановить по правой границе: все совпавшие с right и отличавшиеся от исходных мы считали need=True
-    # но тестам достаточно наличия хотя бы одной записи MISALIGNED_TS, поэтому вернём исходную маску по длине старого df.
-    return out, need
+    return out, need  # маска по старому df (для маркировки факта выравнивания)
 
 
 def _fill_small_internal_gaps(df: pd.DataFrame, *, threshold: float) -> Tuple[pd.DataFrame, np.ndarray]:
     """
     Заполнение внутренних пропусков, если доля пропусков ≤ threshold.
     Синтетика: o=h=l=c(prev_close), v=0.0, is_gap=True.
-    Возвращает (DataFrame, mask_is_gap).
+    Возвращает (DataFrame, mask_is_gap) — маска по НОВОМУ индексу (после reindex).
     """
     if df.empty:
         return df, np.zeros(0, dtype=bool)
@@ -114,13 +106,11 @@ def _fill_small_internal_gaps(df: pd.DataFrame, *, threshold: float) -> Tuple[pd
 
 
 def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[dict], np.ndarray]:
-    """Правки и фиксация нарушений: отрицательный объём, инварианты OHLC."""
     out = df.copy()
     n = len(out)
     flags = np.zeros(n, dtype=np.int32)
     issues: List[dict] = []
 
-    # отрицательный объём → обнуляем, флаг
     if "v" in out.columns:
         neg = out["v"].to_numpy() < 0.0
         if neg.any():
@@ -129,7 +119,6 @@ def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[dict], np.ndarray
             for ts in out.index[neg]:
                 issues.append({"ts": ts, "code": "NEG_V", "note": "negative volume -> 0"})
 
-    # инварианты OHLC: h >= max(o,c), l <= min(o,c) → чиним и флаг
     o = out["o"].to_numpy()
     h = out["h"].to_numpy()
     l = out["l"].to_numpy()
@@ -157,36 +146,31 @@ def _notes_from_flags(flags: np.ndarray) -> List[str]:
 
 def validate(df: pd.DataFrame, *, tf: str = "1m", symbol: str | None = None,
              repair: bool = True, config: QualityConfig | None = None):
-    """
-    1) UTC-индекс и сортировка.
-    2) Выравнивание правых меток 1m к минуте (ceil), если отклонение > tolerance, помечаем MISALIGNED_TS.
-    3) Небольшие внутренние пропуски — автозаполнение синтетикой (is_gap=True, бит MISSING_BARS).
-    4) Чиним инварианты OHLC, обнуляем отрицательный объём; формируем issues и dq_flags/dq_notes.
-    """
     cfg = config or QualityConfig()
     out = _ensure_utc_index(df)
 
-    # 2) Выравнивание правых меток
-    out, mis_mask = _align_to_right_boundary(out, tf=tf, tol_sec=cfg.misaligned_tolerance_seconds)
+    out, mis_mask_old = _align_to_right_boundary(out, tf=tf, tol_sec=cfg.misaligned_tolerance_seconds)
 
-    # 3) Небольшие внутренние пропуски
-    out, _ = _fill_small_internal_gaps(out, threshold=cfg.missing_fill_threshold)
+    out, gap_mask_new = _fill_small_internal_gaps(out, threshold=cfg.missing_fill_threshold)
 
-    # 4) Правки и флаги
     out, issues, flags = _apply_rules(out)
 
-    # Биты за misaligned и gap
-    if len(mis_mask) == len(df) and mis_mask.any():
-        # Проставим флаг MISALIGNED_TS для тех строк исходного df, что были правлены
-        # Сопоставление по позиции исходного df: индексы могли измениться; пометим по ближайшим новым индексам через reindex(method='nearest')
-        mis_idx = pd.Index(df.index[mis_mask])
-        aligned_pos_mask = out.index.isin(mis_idx.ceil("min"))
-        flags = (flags | np.where(aligned_pos_mask, (1 << BIT_MISALIGNED), 0)).astype(np.int32)
-        for ts in out.index[aligned_pos_mask]:
-            issues.append({"ts": ts, "code": "MISALIGNED_TS", "note": "aligned to right boundary"})
+    if len(mis_mask_old) == len(df) and mis_mask_old.any():
+        # маркируем выравнивание: сопоставление по правой границе исходного индекса
+        aligned_right = df.index.ceil("min")
+        mis_right = aligned_right[mis_mask_old]
+        aligned_pos_mask = out.index.isin(mis_right)
+        if aligned_pos_mask.any():
+            flags = (flags | np.where(aligned_pos_mask, (1 << BIT_MISALIGNED), 0)).astype(np.int32)
+            for ts in out.index[aligned_pos_mask]:
+                issues.append({"ts": ts, "code": "MISALIGNED_TS", "note": "aligned to right boundary"})
 
     if "is_gap" in out.columns:
-        flags = (flags | np.where(out["is_gap"].to_numpy(dtype=bool), (1 << BIT_GAP), 0)).astype(np.int32)
+        gap_arr = out["is_gap"].to_numpy(dtype=bool)
+        if gap_arr.any():
+            flags = (flags | np.where(gap_arr, (1 << BIT_GAP), 0)).astype(np.int32)
+        if gap_mask_new.shape == flags.shape and gap_mask_new.any():
+            flags = (flags | np.where(gap_mask_new, (1 << BIT_MISSING_FILL), 0)).astype(np.int32)
 
     out["dq_flags"] = flags
     out["dq_notes"] = _notes_from_flags(flags)
