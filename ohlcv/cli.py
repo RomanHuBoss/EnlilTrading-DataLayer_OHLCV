@@ -1,9 +1,12 @@
 # ohlcv/cli.py — C1/C2 CLI: backfill/update/resample/report + quality-validate
+from __future__ import annotations
+
 import argparse
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable, Dict, List, Sequence
 
 import pandas as pd
 
@@ -15,15 +18,15 @@ from .quality.validator import QualityConfig
 from .quality.validator import validate as dq_validate
 from .utils.timeframes import tf_minutes
 
-# -------------------- общие утилиты --------------------
 
+# -------------------- общие утилиты --------------------
 
 def _data_root(arg: str | None) -> Path:
     base = Path(arg) if arg else Path(os.environ.get("C1_DATA_ROOT", Path.cwd() / "data"))
     return base.expanduser().resolve()
 
 
-def _df_from_rows(rows):
+def _df_from_rows(rows: Sequence[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(
@@ -35,11 +38,11 @@ def _df_from_rows(rows):
     return df[cols]
 
 
-def _print(msg: str):
+def _print(msg: str) -> None:
     print(msg, flush=True)
 
 
-def _print_progress(sym: str, fetched: int, total: int, last_ts: datetime, started_at: datetime):
+def _print_progress(sym: str, fetched: int, total: int, last_ts: datetime, started_at: datetime) -> None:
     pct = (fetched / total * 100.0) if total > 0 else 0.0
     elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
     speed = fetched / elapsed if elapsed > 0 else 0.0
@@ -51,12 +54,12 @@ def _print_progress(sym: str, fetched: int, total: int, last_ts: datetime, start
     )
 
 
-def _hb_printer(sym: str, since: datetime, until: datetime):
-    state = {"last_ms": None}
+def _hb_printer(sym: str, since: datetime, until: datetime) -> Callable[[int, int], None]:
+    state: Dict[str, int | None] = {"last_ms": None}
     total_ms = int((until - since).total_seconds() * 1000) or 1
 
-    def _cb(cursor_ms: int, end_ms: int):
-        if state["last_ms"] is None or (cursor_ms - state["last_ms"]) >= 6 * 60 * 60 * 1000:
+    def _cb(cursor_ms: int, end_ms: int) -> None:  # noqa: ARG001 — сигнатура совместима с вызывающим кодом
+        if state["last_ms"] is None or (cursor_ms - int(state["last_ms"])) >= 6 * 60 * 60 * 1000:
             dt = datetime.fromtimestamp(cursor_ms / 1000, tz=timezone.utc)
             pct = (cursor_ms - int(since.timestamp() * 1000)) / total_ms * 100.0
             _print(f"[{sym}] scanning… up to {dt.strftime('%Y-%m-%d %H:%M')}Z ({pct:5.1f}%)")
@@ -84,8 +87,7 @@ def _align_since_with_launch(
 
 # -------------------- команды --------------------
 
-
-def cmd_backfill(args):
+def cmd_backfill(args: argparse.Namespace) -> None:
     symbols = args.symbols.split(",")
     since = datetime.fromisoformat(args.since)
     since = (
@@ -95,12 +97,12 @@ def cmd_backfill(args):
     )
     until = (
         datetime.fromisoformat(args.until).astimezone(timezone.utc)
-        if args.until
+        if getattr(args, "until", None)
         else datetime.now(timezone.utc)
     )
     since, until = since.replace(second=0, microsecond=0), until.replace(second=0, microsecond=0)
 
-    data_root = _data_root(args.data_root)
+    data_root = _data_root(getattr(args, "data_root", None))
     _print(
         f"[cfg] data_root={str(data_root)}; category={args.category}; spot_align_futures={args.spot_align_futures}"
     )
@@ -115,7 +117,7 @@ def cmd_backfill(args):
             f"[{sym}] backfill 1m {eff_since.isoformat()} → {until.isoformat()}  total≈{total} bars"
         )
 
-        acc = []
+        acc: List[Dict[str, Any]] = []
         heartbeat = _hb_printer(sym, eff_since, until)
         for chunk in iter_klines_1m(
             sym,
@@ -149,12 +151,12 @@ def cmd_backfill(args):
         _print(f"[{sym}] OK → {out_path.resolve()}")
 
 
-def cmd_update(args):
+def cmd_update(args: argparse.Namespace) -> None:
     symbols = args.symbols.split(",")
     now = datetime.now(timezone.utc)
     end = now.replace(second=0, microsecond=0)
 
-    data_root = _data_root(args.data_root)
+    data_root = _data_root(getattr(args, "data_root", None))
     _print(
         f"[cfg] data_root={str(data_root)}; category={args.category}; spot_align_futures={args.spot_align_futures}"
     )
@@ -172,7 +174,7 @@ def cmd_update(args):
 
         _print(f"[{sym}] update 1m from {start.isoformat()} to {end.isoformat()}")
         heartbeat = _hb_printer(sym, start, end)
-        rows_acc: list = []
+        rows_acc: List[Dict[str, Any]] = []
         for chunk in iter_klines_1m(sym, start, end, category=args.category, on_advance=heartbeat):
             rows_acc.extend(chunk)
 
@@ -189,9 +191,9 @@ def cmd_update(args):
         _print(f"[{sym}] OK → {out_path.resolve()}")
 
 
-def cmd_resample(args):
+def cmd_resample(args: argparse.Namespace) -> None:
     symbols = args.symbols.split(",")
-    data_root = _data_root(args.data_root)
+    data_root = _data_root(getattr(args, "data_root", None))
     _print(f"[cfg] data_root={str(data_root)}")
 
     for sym in symbols:
@@ -209,8 +211,8 @@ def cmd_resample(args):
         _print(f"[{sym}] OK → {out_path.resolve()}")
 
 
-def cmd_quality_validate(args):
-    data_root = _data_root(args.data_root)
+def cmd_quality_validate(args: argparse.Namespace) -> None:
+    data_root = _data_root(getattr(args, "data_root", None))
     symbols = args.symbols.split(",")
     tf = args.tf
     _print(
@@ -219,13 +221,13 @@ def cmd_quality_validate(args):
 
     cfg = QualityConfig(
         missing_fill_threshold=args.miss_fill_threshold,
-        spike_window=args.spike_window,
-        spike_k=args.spike_k,
-        flat_streak_threshold=args.flat_streak,
+        spike_window=args.spike_window,  # type: ignore[call-arg]
+        spike_k=args.spike_k,  # type: ignore[call-arg]
+        flat_streak_threshold=args.flat_streak,  # type: ignore[call-arg]
     )
 
-    summary_rows = []
-    all_issues = []
+    summary_rows: List[Dict[str, Any]] = []
+    all_issues: List[pd.DataFrame] = []
 
     for sym in symbols:
         src = parquet_path(data_root, sym, tf)
@@ -250,40 +252,38 @@ def cmd_quality_validate(args):
 
         total = len(df)
         total_clean = len(clean)
-        n_issues = 0 if issues is None else len(issues)
+        n_issues = int(0 if issues is None else len(issues))
         _print(f"[{sym}] summary: rows_in={total} rows_out={total_clean} issues={n_issues}")
 
         summary_rows.append(
             {"symbol": sym, "tf": tf, "rows_in": total, "rows_out": total_clean, "issues": n_issues}
         )
 
-    # Внешние артефакты (C2): issues.{csv,parquet} и quality_summary.{csv,json}
     if all_issues:
         issues_cat = pd.concat(all_issues, axis=0, ignore_index=True)
-        if args.issues:
+        if getattr(args, "issues", None):
             out_issues_csv = Path(args.issues).expanduser().resolve()
             out_issues_csv.parent.mkdir(parents=True, exist_ok=True)
             mode = "a" if (out_issues_csv.exists() and not args.truncate) else "w"
             header = not out_issues_csv.exists() or args.truncate
             issues_cat.to_csv(out_issues_csv, index=False, mode=mode, header=header)
             _print(f"[issues] csv → {out_issues_csv}")
-        if args.issues_parquet:
+        if getattr(args, "issues_parquet", None):
             out_issues_parquet = Path(args.issues_parquet).expanduser().resolve()
             out_issues_parquet.parent.mkdir(parents=True, exist_ok=True)
-            # всегда перезаписываем parquet детерминированно
             issues_cat.to_parquet(out_issues_parquet, index=False)
             _print(f"[issues] parquet → {out_issues_parquet}")
 
     if summary_rows:
         summary_df = pd.DataFrame(summary_rows)
-        if args.quality_summary_csv:
+        if getattr(args, "quality_summary_csv", None):
             out_csv = Path(args.quality_summary_csv).expanduser().resolve()
             out_csv.parent.mkdir(parents=True, exist_ok=True)
             mode = "a" if (out_csv.exists() and not args.truncate) else "w"
             header = not out_csv.exists() or args.truncate
             summary_df.to_csv(out_csv, index=False, mode=mode, header=header)
             _print(f"[summary] csv → {out_csv}")
-        if args.quality_summary_json:
+        if getattr(args, "quality_summary_json", None):
             out_json = Path(args.quality_summary_json).expanduser().resolve()
             out_json.parent.mkdir(parents=True, exist_ok=True)
             obj = {
@@ -298,12 +298,12 @@ def cmd_quality_validate(args):
             _print(f"[summary] json → {out_json}")
 
 
-def cmd_report_missing(args):
+def cmd_report_missing(args: argparse.Namespace) -> None:
     symbols = args.symbols.split(",")
-    data_root = _data_root(args.data_root)
+    data_root = _data_root(getattr(args, "data_root", None))
     _print(f"[cfg] data_root={str(data_root)}")
 
-    out_rows = []
+    out_rows: List[Dict[str, Any]] = []
     for sym in symbols:
         src = parquet_path(data_root, sym, args.tf)
         if not src.exists():
@@ -336,8 +336,7 @@ def cmd_report_missing(args):
 
 # -------------------- точка входа --------------------
 
-
-def main():
+def main() -> None:
     p = argparse.ArgumentParser(prog="c1-ohlcv")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -432,7 +431,8 @@ def main():
     rep.set_defaults(func=cmd_report_missing)
 
     args = p.parse_args()
-    args.func(args)
+    func: Callable[[argparse.Namespace], None] = args.func  # type: ignore[attr-defined]
+    func(args)
 
 
 if __name__ == "__main__":

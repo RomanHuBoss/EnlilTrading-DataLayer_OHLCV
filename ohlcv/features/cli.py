@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -10,7 +11,7 @@ from .utils import BuildMeta
 
 
 def _load_csv(path: Path) -> pd.DataFrame:
-    dtypes = {
+    dtypes: Dict[str, str] = {
         "timestamp_ms": "int64",
         "start_time_iso": "string",
         "open": "float64",
@@ -26,19 +27,19 @@ def _load_csv(path: Path) -> pd.DataFrame:
     return df
 
 
-def _load_params(path: Path | None):
+def _load_params(path: Optional[Path]) -> Dict[str, Any]:
     if not path:
-        return DEFAULTS
+        return dict(DEFAULTS)
     try:
-        import yaml
-    except Exception as e:
+        import yaml  # type: ignore
+    except Exception as e:  # pragma: no cover
         raise RuntimeError("Для чтения YAML-конфига требуется пакет PyYAML") from e
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     return {**DEFAULTS, **cfg}
 
 
-def main(argv=None):
+def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         prog="features-core",
         description="C3 Features.Core — build features from OHLCV CSV/Parquet",
@@ -61,7 +62,6 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if args.cmd == "build":
-        # CSV/Parquet auto-load
         if args.input.suffix.lower() in {".parquet", ".pq"}:
             df = pd.read_parquet(args.input)
         else:
