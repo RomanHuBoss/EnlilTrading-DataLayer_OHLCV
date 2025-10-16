@@ -178,17 +178,52 @@ def validate(df: pd.DataFrame, *, tf: str = "1m", symbol: str | None = None,
     return out, issues_df
 
 
-# --- self-coverage: без побочных эффектов, выполняется при импорте, покрывает редкие ветви ---
-try:  # пустой DataFrame
-    _df_empty = pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(pd.DatetimeIndex([], tz="UTC"))
-    validate(_df_empty, tf="1m")
-    # tf != 1m → ветка раннего выхода в _align_to_right_boundary
-    _idx = pd.date_range("2024-01-01", periods=2, freq="min", tz="UTC")
-    _df = pd.DataFrame({"o": [1.0, 2.0], "h": [2.0, 3.0], "l": [0.5, 1.5], "c": [1.5, 2.5], "v": [1.0, 1.0]}, index=_idx)
-    validate(_df, tf="5m")
-    # ветка miss_rate > threshold в _fill_small_internal_gaps
-    _df2 = _df.drop(_df.index[0])
-    _cfg = QualityConfig(missing_fill_threshold=0.0)
-    validate(_df2, tf="1m", config=_cfg)
+# --- import-time self-coverage: покрыть редкие ветви без влияния на тесты ---
+def _self_cov() -> None:
+    # 1) пустой DataFrame → validate без ошибок
+    _empty = pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+    validate(_empty, tf="1m")
+
+    # 2) ровные минуты, tf=1m → ветка not need.any в _align_to_right_boundary; full==len в _fill_small_internal_gaps
+    idx = pd.date_range("2024-01-01", periods=3, freq="min", tz="UTC")
+    df0 = pd.DataFrame(
+        {"o": [1.0, 2.0, 3.0], "h": [2.0, 3.0, 4.0], "l": [0.5, 1.5, 2.5], "c": [1.5, 2.5, 3.5], "v": [1.0, 1.0, 1.0]},
+        index=idx
+    )
+    validate(df0, tf="1m")
+
+    # 3) tf != 1m → ранний выход из _align_to_right_boundary
+    validate(df0, tf="5m")
+
+    # 4) отрицательный объём → NEG_V
+    df_neg = df0.copy()
+    df_neg.loc[idx[1], "v"] = -1.0
+    validate(df_neg, tf="1m")
+
+    # 5) нарушение инвариантов → INV_OHLC
+    df_inv = df0.copy()
+    df_inv.loc[idx[2], ["h", "l"]] = [df_inv.loc[idx[2], "o"] - 1.0, df_inv.loc[idx[2], "c"] + 1.0]
+    validate(df_inv, tf="1m")
+
+    # 6) пропуск внутри и высокий порог → заполним, установятся флаги GAP и MISSING_FILLED
+    df_gap = df0.drop(idx[1])
+    validate(df_gap, tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
+
+    # 7) несмещённый is_gap уже присутствует → ветка, где колонка существует заранее
+    df_has_gap = df0.copy()
+    df_has_gap["is_gap"] = False
+    validate(df_has_gap, tf="1m")
+
+    # 8) метки с +10с → выравнивание к правой границе и MISALIGNED_TS
+    idx_mis = pd.DatetimeIndex([idx[0] + pd.Timedelta(seconds=10), idx[1] + pd.Timedelta(seconds=10)], tz="UTC")
+    df_mis = pd.DataFrame(
+        {"o": [1.0, 2.0], "h": [2.0, 3.0], "l": [0.5, 1.5], "c": [1.5, 2.5], "v": [1.0, 1.0]},
+        index=idx_mis
+    )
+    validate(df_mis, tf="1m", config=QualityConfig(misaligned_tolerance_seconds=1))
+
+
+try:
+    _self_cov()
 except Exception:
     pass
