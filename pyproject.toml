@@ -1,14 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "c1-ohlcv"
-version = "0.1.0"
+name = "enlil-ohlcv"
+version = "0.2.0"
+description = "C1 DataLayer + C2 DataQuality for OHLCV on Bybit"
+authors = [{ name = "EnlilTrading" }]
+readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["ohlcv", "bybit", "parquet", "data-quality", "resample"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+# Минимальный набор зависимостей; tenacity удалён как неиспользуемый
 dependencies = [
-  "pandas>=2.2",
+  "numpy>=1.26",
+  "pandas>=2.1",
   "pyarrow>=15",
   "requests>=2.31",
-  "python-dateutil>=2.9",
-  "pytz>=2024.1",
-  "tenacity>=8.2",
-  "filelock>=3.13",
-  "pyyaml>=6.0",
+  "filelock>=3.12",
 ]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "ruff>=0.5",
+  "black>=24",
+  "isort>=5",
+  "mypy>=1.8",
+]
+
+[project.scripts]
+c1-ohlcv = "ohlcv.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ohlcv*"]
+exclude = ["tests*"]

@@ -1,3 +1,44 @@
-/.venv/
-/.idea/
-/.env
+# Python / tooling
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+*.dylib
+
+
+# Venv / IDE
+.venv/
+.venv*/
+.env
+.idea/
+.vscode/
+*.code-workspace
+
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.whl
+
+
+# Test/cache
+.pytest_cache/
+.coverage*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+
+# Data/outputs
+/data/
+reports/
+*.parquet
+*.lock
+
+
+# OS cruft
+.DS_Store
+Thumbs.db

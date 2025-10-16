@@ -1,4 +1,4 @@
-# ohlcv/cli.py — heartbeat в «пустых» окнах: прогресс печатается даже до первой реальной свечи
+# ohlcv/cli.py — C1/C2 CLI: backfill/update/resample/report + quality-validate
 import os
 import argparse
 from pathlib import Path
@@ -11,6 +11,8 @@ from .core.resample import resample_ohlcv
 from .core.validate import validate_1m_index, ensure_missing_threshold, fill_1m_gaps
 from .io.parquet_store import write_idempotent, parquet_path
 from .utils.timeframes import tf_minutes
+from .quality.validator import validate as dq_validate
+from .quality.validator import QualityConfig
 
 
 def _data_root(arg: str | None) -> Path:
@@ -45,7 +47,6 @@ def _print_progress(sym: str, fetched: int, total: int, last_ts: datetime, start
 
 
 def _hb_printer(sym: str, since: datetime, until: datetime):
-    # Печать «живости» даже при пустых страницах: раз в 6 часов данных или чаще на старте
     state = {"last_ms": None}
     total_ms = int((until - since).total_seconds() * 1000) or 1
 
@@ -72,7 +73,6 @@ def cmd_backfill(args):
     for sym in symbols:
         eff_since = since
         if args.category == "spot" and args.spot_align_futures:
-            # выровнять по минимальному launchTime фьючерсов
             lt_candidates = [get_launch_time(sym, category=c) for c in ("linear", "inverse")]
             fut_lt = min([lt for lt in lt_candidates if lt], default=None)
             if fut_lt and fut_lt > eff_since:
@@ -179,6 +179,50 @@ def cmd_resample(args):
         _print(f"[{sym}] OK → {out_path.resolve()}")
 
 
+def cmd_quality_validate(args):
+    data_root = _data_root(args.data_root)
+    symbols = args.symbols.split(",")
+    tf = args.tf
+    _print(f"[cfg] data_root={str(data_root)}; tf={tf}; write={args.write}; issues={args.issues}")
+
+    cfg = QualityConfig(
+        missing_fill_threshold=args.miss_fill_threshold,
+        spike_window=args.spike_window,
+        spike_k=args.spike_k,
+        flat_streak_threshold=args.flat_streak,
+    )
+
+    for sym in symbols:
+        src = parquet_path(data_root, sym, tf)
+        if not src.exists():
+            _print(f"[{sym}] файл не найден: {src}")
+            continue
+        _print(f"[{sym}] quality-validate {tf} ← {src}")
+
+        df = pd.read_parquet(src)
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        df = df.set_index("ts").sort_index()
+
+        clean, issues = dq_validate(df, tf=tf, symbol=sym, repair=not args.no_repair, config=cfg)
+
+        if args.issues:
+            out_issues = Path(args.issues).expanduser().resolve()
+            out_issues.parent.mkdir(parents=True, exist_ok=True)
+            mode = "a" if out_issues.exists() else "w"
+            header = not out_issues.exists()
+            issues.assign(symbol=sym, tf=tf).to_csv(out_issues, mode=mode, header=header, index=False)
+            _print(f"[{sym}] issues → {out_issues}")
+
+        if args.write:
+            out_path = write_idempotent(data_root, sym, tf, clean)
+            _print(f"[{sym}] clean {tf} → {out_path.resolve()}")
+
+        total = len(df)
+        total_clean = len(clean)
+        n_issues = len(issues)
+        _print(f"[{sym}] summary: rows_in={total} rows_out={total_clean} issues={n_issues}")
+
+
 def cmd_report_missing(args):
     symbols = args.symbols.split(",")
     data_root = _data_root(args.data_root)
@@ -239,6 +283,19 @@ def main():
     r.add_argument("--to-tf", required=True, choices=["5m", "15m", "1h"])
     r.add_argument("--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT")
     r.set_defaults(func=cmd_resample)
+
+    q = sub.add_parser("quality-validate", help="C2 DataQuality: валидация и санитайз Parquet")
+    q.add_argument("--symbols", required=True, help="CSV тикеров")
+    q.add_argument("--tf", required=True, choices=["1m", "5m", "15m", "1h"])
+    q.add_argument("--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT")
+    q.add_argument("--write", action="store_true", help="Перезаписать очищенный файл Parquet")
+    q.add_argument("--issues", required=False, help="Путь для CSV-журнала проблем; если файл существует — дописывать")
+    q.add_argument("--no-repair", action="store_true", help="Только диагностировать, без автоправок")
+    q.add_argument("--miss-fill-threshold", type=float, default=0.0001, help="Порог заполнения пропусков для 1m")
+    q.add_argument("--spike-window", type=int, default=200, help="Окно MAD-детектора всплесков")
+    q.add_argument("--spike-k", type=float, default=12.0, help="Порог MAD-критерия")
+    q.add_argument("--flat-streak", type=int, default=300, help="Длина серии нулевого объёма")
+    q.set_defaults(func=cmd_quality_validate)
 
     rep = sub.add_parser("report-missing", help="Отчёт о пропусках")
     rep.add_argument("--symbols", required=True)

@@ -1,23 +1,38 @@
-# Мэппинг таймфреймов и утилиты.
-from datetime import timedelta
+# ohlcv/utils/timeframes.py
+# Примитивы работы с таймфреймами без deprecated-правил Pandas.
+# Используются нижние регистры: "min", "5min", "15min", "1h".
 
-TF_MINUTES = {
-    "1m": 1,
-    "5m": 5,
-    "15m": 15,
-    "1h": 60,
-}
+from __future__ import annotations
 
-def tf_to_pandas_rule(tf: str) -> str:
-    if tf not in TF_MINUTES:
-        raise ValueError(f"Неизвестный таймфрейм: {tf}")
-    # Использовать новые алиасы pandas: min/h
-    return {
-        "1m": "1min",
-        "5m": "5min",
-        "15m": "15min",
-        "1h": "1h",
-    }[tf]
+from typing import Literal
 
-def tf_minutes(tf: str) -> int:
-    return TF_MINUTES[tf]
+AllowedTF = Literal["1m", "5m", "15m", "1h"]
+
+
+def tf_minutes(tf: AllowedTF) -> int:
+    if tf == "1m":
+        return 1
+    if tf == "5m":
+        return 5
+    if tf == "15m":
+        return 15
+    if tf == "1h":
+        return 60
+    raise ValueError(f"Неизвестный TF: {tf}")
+
+
+def tf_to_pandas_rule(tf: AllowedTF) -> str:
+    # pandas >= 2.2: 'T' и 'H' помечены как deprecated; используем 'min' и 'h'.
+    if tf == "1m":
+        return "min"
+    if tf == "5m":
+        return "5min"
+    if tf == "15m":
+        return "15min"
+    if tf == "1h":
+        return "1h"
+    raise ValueError(f"Неизвестный TF: {tf}")
+
+
+def is_supported_tf(tf: str) -> bool:
+    return tf in {"1m", "5m", "15m", "1h"}

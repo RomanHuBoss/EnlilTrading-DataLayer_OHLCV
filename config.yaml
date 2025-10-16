@@ -1,7 +1,0 @@
-# config.yaml — опционально; можно не использовать, если CLI вызывается с флагами.
-symbols:
-  - BTCUSDT
-  - ETHUSDT
-  - SOLUSDT
-  - BNBUSDT
-  - XRPUSDT

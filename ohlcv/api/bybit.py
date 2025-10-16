@@ -1,180 +1,190 @@
-# ohlcv/api/bybit.py — Market v5: 1m OHLCV (чанки/буфер) + instruments-info.launchTime + heartbeat callback
-# Документация:
-#   Kline:            https://bybit-exchange.github.io/docs/v5/market/kline
-#   InstrumentsInfo:  https://bybit-exchange.github.io/docs/v5/market/instrument
+# ohlcv/api/bybit.py — Bybit v5 REST, публичные эндпоинты для OHLCV 1m и launchTime
+# Все времена — UTC. Возвращаемые бары — правая граница (ts = start_ms + 60_000 - 0?)
+# Для согласованности с пайплайном C1/C2 используем ts как правая граница минуты.
+
+from __future__ import annotations
+
 import time
-from typing import Iterable, List, Optional, Dict, Callable
-from datetime import datetime, timezone
-import hashlib
-import hmac
+from datetime import datetime, timezone, timedelta
+from typing import Callable, Dict, Generator, Iterable, List, Optional
+
 import requests
-from requests import Response
 
 BASE_URL = "https://api.bybit.com"
+USER_AGENT = "EnlilTrading-DataLayer/1.0 (python-requests)"
+
+# Ограничения Bybit: limit<=1000, интервал 1m передаётся как "1" (минуты)
+KLINE_LIMIT = 1000
 
 
-def _ms(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
+def _http_get(path: str,
+              params: Dict[str, str | int | float | None],
+              headers: Optional[Dict[str, str]] = None,
+              *,
+              timeout: int = 20,
+              max_retries: int = 5,
+              backoff_base: float = 0.8) -> requests.Response:
+    url = f"{BASE_URL}{path}"
+    h = {"User-Agent": USER_AGENT}
+    if headers:
+        h.update(headers)
 
-
-def _sign(api_secret: str, payload: str) -> str:
-    return hmac.new(api_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-
-
-def _http_get(path: str, params: Dict, headers: Dict, *, timeout: int, max_retries: int, backoff_base: float) -> Response:
-    url = BASE_URL + path
-    for attempt in range(max_retries):
+    last_err = None
+    for attempt in range(max_retries + 1):
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
-            if r.status_code == 200:
-                return r
-        except requests.RequestException:
+            r = requests.get(url, params={k: v for k, v in params.items() if v is not None}, headers=h, timeout=timeout)
+            if r.status_code >= 500:
+                # серверные ошибки — ретрай с бэкоффом
+                raise requests.HTTPError(f"{r.status_code} {r.text[:200]}")
+            return r
+        except Exception as e:
+            last_err = e
+            if attempt >= max_retries:
+                break
+            sleep = backoff_base * (2 ** attempt)
+            time.sleep(sleep)
+    # если дошли сюда — ретраи исчерпаны
+    if isinstance(last_err, Exception):
+        raise last_err
+    raise RuntimeError("HTTP GET failed with unknown error")
+
+
+def _iso_from_ms(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+
+
+def _rows_from_kline_list(lst: List[List[str]]) -> List[Dict[str, float]]:
+    # Формат Bybit v5: [ startMs, open, high, low, close, volume, turnover ] — строки
+    out: List[Dict[str, float]] = []
+    for it in lst:
+        start_ms = int(it[0])
+        o = float(it[1]); h = float(it[2]); l = float(it[3]); c = float(it[4])
+        v = float(it[5])
+        # правую границу минуты — по постановке работаем с правой границей
+        ts_iso = _iso_from_ms(start_ms + 60_000)
+        row = {"ts": ts_iso, "o": o, "h": h, "l": l, "c": c, "v": v}
+        # turnover (опционально)
+        try:
+            t = float(it[6])
+            row["t"] = t
+        except Exception:
             pass
-        time.sleep(backoff_base * (2 ** attempt))
-    r = requests.get(url, params=params, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r
+        out.append(row)
+    return out
 
 
-def get_launch_time(symbol: str, *, category: str = "linear", timeout: int = 30, max_retries: int = 5) -> Optional[datetime]:
+def iter_klines_1m(symbol: str,
+                   since: datetime,
+                   until: datetime,
+                   *,
+                   api_key: Optional[str] = None,
+                   api_secret: Optional[str] = None,
+                   category: str = "spot",
+                   on_advance: Optional[Callable[[int, int], None]] = None,
+                   timeout: int = 20,
+                   max_retries: int = 5,
+                   sleep_sec: float = 0.2) -> Generator[List[Dict[str, float]], None, None]:
     """
-    Возвращает UTC datetime запуска инструмента для категорий linear|inverse (поле launchTime в мс).
-    Для spot, как правило, поле отсутствует → None.
+    Генератор чанков 1m баров для диапазона [since, until]. Пагинация вперёд по времени.
+    Категории: spot | linear | inverse. Ключи не требуются для публичных методов.
+    Возвращает чанки по <=1000 баров в виде списка словарей с ISO ts.
     """
-    path = "/v5/market/instruments-info"
-    params = {"category": category, "symbol": symbol}
-    r = _http_get(path, params, headers={}, timeout=timeout, max_retries=max_retries, backoff_base=0.2)
-    data = r.json()
-    if data.get("retCode") != 0:
-        return None
-    items = (data.get("result") or {}).get("list") or []
-    if not items:
-        return None
-    item = items[0]
-    lt = item.get("launchTime")
-    if lt is None:
-        return None
-    try:
-        ts_ms = int(lt)
-        return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).replace(second=0, microsecond=0)
-    except Exception:
-        return None
-
-
-def iter_klines_1m(
-    symbol: str,
-    start: datetime,
-    end: datetime,
-    *,
-    category: str = "spot",             # spot|linear|inverse
-    api_key: Optional[str] = None,      # read-only
-    api_secret: Optional[str] = None,   # не требуется для публичного маркет-эндпоинта
-    limit: int = 1000,
-    sleep_sec: float = 0.2,
-    max_retries: int = 5,
-    timeout: int = 30,
-    on_advance: Optional[Callable[[int, int], None]] = None,  # callback(cursor_ms, end_ms) — вызывается при каждом сдвиге курсора
-) -> Iterable[List[Dict]]:
-    """
-    Итеративная загрузка 1m OHLCV: выдаёт чанки по мере получения.
-    Формат: {"ts","o","h","l","c","v","t?"}; окно [start, end), UTC.
-    on_advance: вызывается при любом продвижении курсора, даже если ответ пустой.
-    """
-    if start.tzinfo is None or end.tzinfo is None:
-        raise ValueError("start/end должны быть tz-aware UTC")
-    if end <= start:
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    if since >= until:
         return
 
-    path = "/v5/market/kline"
-    interval = "1"
+    # У Bybit start/end — миллисекунды. Интервал включительно. interval=1 → 1m
+    start_ms = int(since.timestamp() * 1000)
+    end_ms = int(until.timestamp() * 1000)
 
-    start_ms = _ms(start)
-    end_ms = _ms(end)
+    path = "/v5/market/kline"
+    params_base = {
+        "category": category,
+        "symbol": symbol,
+        "interval": "1",
+    }
 
     cursor = start_ms
     while cursor < end_ms:
-        params = {
-            "category": category,
-            "symbol": symbol,
-            "interval": interval,
+        # window до end_ms, но Bybit может возвращать меньше limit
+        params = dict(params_base)
+        params.update({
             "start": cursor,
-            "end": min(end_ms, cursor + limit * 60_000),
-            "limit": str(limit),
-        }
-        headers: Dict[str, str] = {}
-        if api_key:
-            headers["X-BAPI-API-KEY"] = api_key
-
-        r = _http_get(path, params, headers, timeout=timeout, max_retries=max_retries, backoff_base=sleep_sec)
+            "end": end_ms,
+            "limit": KLINE_LIMIT,
+        })
+        r = _http_get(path, params, timeout=timeout, max_retries=max_retries, backoff_base=sleep_sec)
         data = r.json()
-        if data.get("retCode") != 0:
+        if str(data.get("retCode")) != "0":
             raise RuntimeError(f"Bybit error: {data.get('retCode')} {data.get('retMsg')}")
-
-        rows = (data.get("result") or {}).get("list") or []
-        if not rows:
-            cursor += limit * 60_000
+        result = data.get("result") or {}
+        lst = result.get("list") or []
+        if not lst:
+            # продвигаем курсор, чтобы не зациклиться: шаг 1000 минут или до конца
+            cursor = min(cursor + KLINE_LIMIT * 60_000, end_ms)
             if on_advance:
-                on_advance(min(cursor, end_ms), end_ms)
+                on_advance(cursor, end_ms)
             time.sleep(sleep_sec)
             continue
-
-        rows = list(reversed(rows))
-
-        chunk: List[Dict] = []
-        for row in rows:
-            ts_ms = int(row[0])
-            if ts_ms < start_ms or ts_ms >= end_ms:
-                continue
-            chunk.append({
-                "ts": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat(),
-                "o": float(row[1]),
-                "h": float(row[2]),
-                "l": float(row[3]),
-                "c": float(row[4]),
-                "v": float(row[5]),
-                "t": float(row[6]) if len(row) > 6 and row[6] is not None else None,
-            })
-
-        if chunk:
-            # продвинулись до правого края возвращённого окна
-            last_ms = int(rows[-1][0]) + 60_000
-            if on_advance:
-                on_advance(min(last_ms, end_ms), end_ms)
-            yield chunk
-            cursor = last_ms
-        else:
-            cursor += limit * 60_000
-            if on_advance:
-                on_advance(min(cursor, end_ms), end_ms)
-
+        rows = _rows_from_kline_list(sorted(lst, key=lambda x: int(x[0])))
+        yield rows
+        # продвижение курсора: берём последний start_ms + 60_000
+        last_start_ms = int(lst[0][0]) if int(lst[0][0]) > int(lst[-1][0]) else int(lst[-1][0])
+        cursor = last_start_ms + KLINE_LIMIT * 0  # не шагать по 1000 минут, а строго к последнему+60_000
+        cursor = last_start_ms + 60_000
+        if on_advance:
+            on_advance(cursor, end_ms)
         time.sleep(sleep_sec)
 
 
-def fetch_klines_1m(
-    symbol: str,
-    start: datetime,
-    end: datetime,
-    api_key: Optional[str] = None,
-    api_secret: Optional[str] = None,
-    limit: int = 1000,
-    sleep_sec: float = 0.2,
-    *,
-    category: str = "spot",
-    max_retries: int = 5,
-    timeout: int = 30
-) -> List[Dict]:
-    out: List[Dict] = []
-    for chunk in iter_klines_1m(
-        symbol,
-        start,
-        end,
-        category=category,
-        api_key=api_key,
-        api_secret=api_secret,
-        limit=limit,
-        sleep_sec=sleep_sec,
-        max_retries=max_retries,
-        timeout=timeout,
-    ):
-        out.extend(chunk)
-    return out
+def fetch_klines_1m(symbol: str,
+                    since: datetime,
+                    until: datetime,
+                    *,
+                    api_key: Optional[str] = None,
+                    api_secret: Optional[str] = None,
+                    category: str = "spot",
+                    timeout: int = 20,
+                    max_retries: int = 5) -> List[Dict[str, float]]:
+    acc: List[Dict[str, float]] = []
+    for chunk in iter_klines_1m(symbol, since, until, api_key=api_key, api_secret=api_secret,
+                                category=category, timeout=timeout, max_retries=max_retries):
+        acc.extend(chunk)
+    return acc
+
+
+def get_launch_time(symbol: str, *, category: str = "spot", timeout: int = 20, max_retries: int = 5) -> Optional[datetime]:
+    """
+    Возвращает дату/время запуска инструмента (по Bybit v5 instruments-info) для категории.
+    Для spot возвращаем минимальную из доступных дат (если есть), иначе None.
+    Поле может называться launchTime/createdTime. Возвращаем tz-aware UTC.
+    """
+    path = "/v5/market/instruments-info"
+    params = {
+        "category": category,
+        "symbol": symbol,
+    }
+    r = _http_get(path, params, timeout=timeout, max_retries=max_retries)
+    data = r.json()
+    if str(data.get("retCode")) != "0":
+        return None
+    result = data.get("result") or {}
+    lst = result.get("list") or []
+    if not lst:
+        return None
+    # В ответе могут быть разные контракты/варианты. Берём минимальную доступную дату.
+    candidates: List[int] = []
+    for it in lst:
+        for key in ("launchTime", "createdTime", "listTime"):
+            if key in it and it[key] is not None:
+                try:
+                    candidates.append(int(it[key]))
+                except Exception:
+                    pass
+    if not candidates:
+        return None
+    ms = min(candidates)
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
