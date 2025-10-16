@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from .api.bybit import fetch_klines_1m, iter_klines_1m, get_launch_time
+from .api.bybit import iter_klines_1m, get_launch_time
 from .core.resample import resample_ohlcv
 from .core.validate import validate_1m_index, ensure_missing_threshold, fill_1m_gaps
 from .io.parquet_store import write_idempotent, parquet_path
@@ -14,6 +14,8 @@ from .utils.timeframes import tf_minutes
 from .quality.validator import validate as dq_validate
 from .quality.validator import QualityConfig
 
+
+# -------------------- общие утилиты --------------------
 
 def _data_root(arg: str | None) -> Path:
     base = Path(arg) if arg else Path(os.environ.get("C1_DATA_ROOT", Path.cwd() / "data"))
@@ -23,7 +25,7 @@ def _data_root(arg: str | None) -> Path:
 def _df_from_rows(rows):
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["o", "h", "l", "c", "v"])
+        return pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(pd.DatetimeIndex([], tz="UTC"))
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     df = df.set_index("ts").sort_index()
     cols = ["o", "h", "l", "c", "v"] + (["t"] if "t" in df.columns else [])
@@ -60,6 +62,23 @@ def _hb_printer(sym: str, since: datetime, until: datetime):
     return _cb
 
 
+def _align_since_with_launch(sym: str, eff_since: datetime, category: str, spot_align_futures: bool) -> datetime:
+    """Кламп начала окна к launchTime категории; для spot опционально к мин(launchTime linear,inverse)."""
+    lt = get_launch_time(sym, category=category)
+    if lt and lt > eff_since:
+        eff_since = lt
+        _print(f"[{sym}] aligned to {category} launchTime → {eff_since.isoformat()}")
+    if category == "spot" and spot_align_futures:
+        fut_candidates = [get_launch_time(sym, category=c) for c in ("linear", "inverse")]
+        fut_lt = min([x for x in fut_candidates if x is not None], default=None)
+        if fut_lt and fut_lt > eff_since:
+            eff_since = fut_lt
+            _print(f"[{sym}] spot aligned to futures launchTime → {eff_since.isoformat()}")
+    return eff_since
+
+
+# -------------------- команды --------------------
+
 def cmd_backfill(args):
     symbols = args.symbols.split(",")
     since = datetime.fromisoformat(args.since)
@@ -71,13 +90,7 @@ def cmd_backfill(args):
     _print(f"[cfg] data_root={str(data_root)}; category={args.category}; spot_align_futures={args.spot_align_futures}")
 
     for sym in symbols:
-        eff_since = since
-        if args.category == "spot" and args.spot_align_futures:
-            lt_candidates = [get_launch_time(sym, category=c) for c in ("linear", "inverse")]
-            fut_lt = min([lt for lt in lt_candidates if lt], default=None)
-            if fut_lt and fut_lt > eff_since:
-                eff_since = fut_lt
-                _print(f"[{sym}] spot aligned to futures launchTime → {eff_since.isoformat()}")
+        eff_since = _align_since_with_launch(sym, since, args.category, args.spot_align_futures)
 
         total = int((until - eff_since).total_seconds() // 60)
         fetched = 0
@@ -133,12 +146,7 @@ def cmd_update(args):
             start = last_ts + pd.Timedelta(minutes=1)
         else:
             start = end - pd.Timedelta(days=7)
-            if args.category == "spot" and args.spot_align_futures:
-                lt_candidates = [get_launch_time(sym, category=c) for c in ("linear", "inverse")]
-                fut_lt = min([lt for lt in lt_candidates if lt], default=None)
-                if fut_lt and fut_lt > start:
-                    start = fut_lt
-                    _print(f"[{sym}] update aligned to futures launchTime → {start.isoformat()}")
+        start = _align_since_with_launch(sym, start, args.category, args.spot_align_futures)
 
         _print(f"[{sym}] update 1m from {start.isoformat()} to {end.isoformat()}")
         heartbeat = _hb_printer(sym, start, end)
@@ -256,6 +264,8 @@ def cmd_report_missing(args):
     pd.DataFrame(out_rows).to_csv(out_path, index=False)
     _print(f"report → {out_path}")
 
+
+# -------------------- точка входа --------------------
 
 def main():
     p = argparse.ArgumentParser(prog="c1-ohlcv")
