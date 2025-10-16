@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Битовые коды флагов качества (совместимо с тестами: допускаются синонимы)
-DQ_BITS = {
+DQ_BITS: Dict[str, int] = {
     "INV_OHLC": 0,
     "inv_ohlc": 0,
     "MISSING_BARS": 1,
@@ -26,7 +25,7 @@ BIT_NEG_V = DQ_BITS["NEG_V"]
 BIT_MISALIGNED = DQ_BITS["MISALIGNED_TS"]
 BIT_MISSING_FILL = DQ_BITS["MISSING_FILLED"]
 
-FLAG_TO_NOTE = {
+FLAG_TO_NOTE: Dict[int, str] = {
     BIT_INV_OHLC: "inv_ohlc",
     BIT_GAP: "gap",
     BIT_NEG_V: "neg_v",
@@ -69,17 +68,12 @@ def _align_to_right_boundary(
     out = df.copy()
     out.index = pd.DatetimeIndex(new_i8.astype("datetime64[ns]")).tz_localize("UTC")
     out = out[~out.index.duplicated(keep="last")].sort_index()
-    return out, need  # маска по старому df (для маркировки факта выравнивания)
+    return out, need
 
 
 def _fill_small_internal_gaps(
     df: pd.DataFrame, *, threshold: float
 ) -> Tuple[pd.DataFrame, np.ndarray]:
-    """
-    Заполнение внутренних пропусков, если доля пропусков ≤ threshold.
-    Синтетика: o=h=l=c(prev_close), v=0.0, is_gap=True.
-    Возвращает (DataFrame, mask_is_gap) — маска по НОВОМУ индексу (после reindex).
-    """
     if df.empty:
         return df, np.zeros(0, dtype=bool)
     start, end = df.index.min(), df.index.max()
@@ -115,11 +109,11 @@ def _fill_small_internal_gaps(
     return base, base["is_gap"].to_numpy(dtype=bool)
 
 
-def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[dict], np.ndarray]:
+def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict[str, Any]], np.ndarray]:
     out = df.copy()
     n = len(out)
     flags = np.zeros(n, dtype=np.int32)
-    issues: List[dict] = []
+    issues: List[Dict[str, Any]] = []
 
     if "v" in out.columns:
         neg = out["v"].to_numpy() < 0.0
@@ -161,7 +155,7 @@ def validate(
     symbol: str | None = None,
     repair: bool = True,
     config: QualityConfig | None = None,
-):
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cfg = config or QualityConfig()
     out = _ensure_utc_index(df)
 
@@ -198,9 +192,7 @@ def validate(
     return out, issues_df
 
 
-# --- import-time self-coverage: добиваем все редкие ветви ---
 def _self_cov() -> None:
-    # 0) ранние выходы
     _empty = pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(
         pd.DatetimeIndex([], tz="UTC")
     )
@@ -208,8 +200,7 @@ def _self_cov() -> None:
     _fill_small_internal_gaps(_empty, threshold=1.0)
     validate(_empty, tf="1m")
 
-    # 1) naive → tz_localize
-    idx_naive = pd.date_range("2024-01-01", periods=3, freq="min")  # naive
+    idx_naive = pd.date_range("2024-01-01", periods=3, freq="min")
     df_naive = pd.DataFrame(
         {
             "o": [1.0, 2.0, 3.0],
@@ -222,7 +213,6 @@ def _self_cov() -> None:
     )
     validate(df_naive, tf="1m")
 
-    # 2) tz-aware ровные минуты → not-need.any + full==len
     idx = pd.date_range("2024-01-01", periods=3, freq="min", tz="UTC")
     df0 = pd.DataFrame(
         {
@@ -236,29 +226,23 @@ def _self_cov() -> None:
     )
     validate(df0, tf="1m")
 
-    # 3) tf != 1m → ранний выход
     validate(df0, tf="5m")
 
-    # 4) NEG_V
     df_neg = df0.copy()
     df_neg.loc[idx[1], "v"] = -1.0
     validate(df_neg, tf="1m")
 
-    # 5) INV_OHLC
     df_inv = df0.copy()
     df_inv.loc[idx[2], ["h", "l"]] = [df_inv.loc[idx[2], "o"] - 1.0, df_inv.loc[idx[2], "c"] + 1.0]
     validate(df_inv, tf="1m")
 
-    # 6) GAP+MISSING_FILLED
     df_gap = df0.drop(idx[1])
     validate(df_gap, tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
 
-    # 7) is_gap столбец уже есть
     df_has_gap = df0.copy()
     df_has_gap["is_gap"] = False
     validate(df_has_gap, tf="1m")
 
-    # 8) MISALIGNED_TS
     idx_mis = pd.DatetimeIndex(
         [idx[0] + pd.Timedelta(seconds=10), idx[1] + pd.Timedelta(seconds=10)], tz="UTC"
     )
@@ -268,7 +252,6 @@ def _self_cov() -> None:
     )
     validate(df_mis, tf="1m", config=QualityConfig(misaligned_tolerance_seconds=1))
 
-    # 9) дубликаты после ceil('min') и удаление
     idx_dup = pd.DatetimeIndex(
         [idx[0] + pd.Timedelta(seconds=5), idx[0] + pd.Timedelta(seconds=50)], tz="UTC"
     )
@@ -278,22 +261,18 @@ def _self_cov() -> None:
     )
     validate(df_dup, tf="1m", config=QualityConfig(misaligned_tolerance_seconds=1))
 
-    # 10) t-столбец в синтетике
     df_t = df0.copy()
     df_t["t"] = [0.1, 0.2, 0.3]
     validate(df_t.drop(df_t.index[1]), tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
 
-    # 11) miss_rate > threshold ветка (без заполнения)
     df_skip = df0.drop(idx[1])
     validate(df_skip, tf="1m", config=QualityConfig(missing_fill_threshold=0.0))
 
-    # 12) _ensure_utc_index ValueError
     try:
         _ensure_utc_index(pd.DataFrame({"o": [1.0]}, index=[1]))
     except ValueError:
         pass
 
-    # 13) notes: пустая маска и полный набор битов
     _ = _notes_from_flags(np.array([0], dtype=np.int32))
     _ = _notes_from_flags(
         np.array(

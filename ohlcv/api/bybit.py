@@ -1,42 +1,47 @@
 # ohlcv/api/bybit.py — Bybit v5 REST, публичные эндпоинты для OHLCV 1m и launchTime
-# Все времена — UTC. Возвращаемые бары — правая граница (ts = start_ms + 60_000).
-
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Callable, Dict, Generator, List, Optional
+from typing import (
+    Any,
+    Callable,
+    Generator,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Sequence,
+    TypedDict,
+)
 
 import requests
 
 BASE_URL = "https://api.bybit.com"
 USER_AGENT = "EnlilTrading-DataLayer/1.0 (python-requests)"
 
-# Ограничения Bybit: limit<=1000, интервал 1m передаётся как "1"
-KLINE_LIMIT = 1000
+KLINE_LIMIT = 1000  # limit<=1000, интервал 1m → "1"
+RATE_LIMIT_CODES = {"10006"}
 
-# Коды Bybit, требующие паузы/повтора
-RATE_LIMIT_CODES = {"10006"}  # Too many visits. Exceeded the API Rate Limit.
+
+class KlineRow(TypedDict, total=False):
+    ts: str
+    o: float
+    h: float
+    l: float  # noqa: E741 — оставляем ключ 'l' ради совместимости со схемой C1/C2
+    c: float
+    v: float
+    t: float
 
 
 def _parse_retry_after_seconds(resp: requests.Response) -> Optional[float]:
-    """
-    Извлекает рекомендуемую паузу из заголовков/тела ответа, если доступно.
-    Поддерживаемые источники:
-      - Retry-After (секунды)
-      - X-RateLimit-Reset, X-Rate-Limit-Reset (unix/мс → вычисление дельты)
-      - X-Bapi-Limit-Reset-Timestamp, X-Bapi-Rate-Limit-Reset-Timestamp (мс)
-    Если ничего нет — None.
-    """
     h = resp.headers or {}
-    # 1) Retry-After: целые секунды
     for k in ("Retry-After", "retry-after"):
         if k in h:
             try:
                 return float(h[k])
             except Exception:
                 pass
-    # 2) Разные варианты "reset" таймштампов
     now = time.time()
     for k in (
         "X-RateLimit-Reset",
@@ -47,16 +52,14 @@ def _parse_retry_after_seconds(resp: requests.Response) -> Optional[float]:
         if k in h:
             val = h[k]
             try:
-                # бывают секунды или миллисекунды; нормализуем
                 ts = float(val)
-                if ts > 10_000_000_000:  # вероятно мс
+                if ts > 10_000_000_000:
                     ts /= 1000.0
                 wait = max(0.0, ts - now)
                 if wait > 0:
                     return wait
             except Exception:
                 pass
-    # 3) Попробуем retExtInfo из JSON (если уже парсили вне)
     try:
         data = resp.json()
         ext = data.get("retExtInfo") or {}
@@ -75,22 +78,15 @@ def _parse_retry_after_seconds(resp: requests.Response) -> Optional[float]:
 
 def _http_get(
     path: str,
-    params: Dict[str, str | int | float | None],
-    headers: Optional[Dict[str, str]] = None,
+    params: Mapping[str, str | int | float | None],
+    headers: Mapping[str, str] | None = None,
     *,
     timeout: int = 20,
     max_retries: int = 10,
     backoff_base: float = 0.4,
 ) -> requests.Response:
-    """
-    GET с устойчивостью к 5xx, 429 и retCode=10006 (лимит).
-    Поведение:
-      - 5xx → экспоненциальный ретрай.
-      - 429/10006 → пауза по Retry-After/Reset, иначе экспоненциальная.
-      - Прочие 2xx возвращаются вызывающему коду.
-    """
     url = f"{BASE_URL}{path}"
-    h = {"User-Agent": USER_AGENT}
+    h: MutableMapping[str, str] = {"User-Agent": USER_AGENT}
     if headers:
         h.update(headers)
 
@@ -105,17 +101,13 @@ def _http_get(
                 headers=h,
                 timeout=timeout,
             )
-            # 5xx → ретрай
             if r.status_code >= 500:
                 raise requests.HTTPError(f"{r.status_code} {r.text[:200]}")
-            # 429 → подождать и повторить
             if r.status_code == 429:
                 wait = _parse_retry_after_seconds(r) or sleep
                 time.sleep(wait)
                 sleep = min(sleep * 2, 8.0)
                 continue
-
-            # 2xx → проверим лимит в теле
             try:
                 data = r.json()
                 rc = str(data.get("retCode"))
@@ -123,13 +115,10 @@ def _http_get(
                     wait = _parse_retry_after_seconds(r) or sleep
                     time.sleep(wait)
                     sleep = min(sleep * 2, 8.0)
-                    continue  # повторить запрос
+                    continue
             except Exception:
-                # тело не JSON — отдадим наверх, пусть обработает вызывающий
                 pass
-
             return r
-
         except Exception as e:
             last_err = e
             if attempt >= max_retries:
@@ -146,9 +135,8 @@ def _iso_from_ms(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
 
 
-def _rows_from_kline_list(lst: List[List[str]]) -> List[Dict[str, float]]:
-    # Формат Bybit v5: [ startMs, open, high, low, close, volume, turnover ] — строки
-    out: List[Dict[str, float]] = []
+def _rows_from_kline_list(lst: Sequence[Sequence[str]]) -> List[KlineRow]:
+    out: List[KlineRow] = []
     for it in lst:
         start_ms = int(it[0])
         o = float(it[1])
@@ -156,8 +144,8 @@ def _rows_from_kline_list(lst: List[List[str]]) -> List[Dict[str, float]]:
         low = float(it[3])
         c = float(it[4])
         v = float(it[5])
-        ts_iso = _iso_from_ms(start_ms + 60_000)  # правая граница
-        row: Dict[str, float] = {"ts": ts_iso, "o": o, "h": high, "l": low, "c": c, "v": v}
+        ts_iso = _iso_from_ms(start_ms + 60_000)
+        row: KlineRow = {"ts": ts_iso, "o": o, "h": high, "l": low, "c": c, "v": v}
         if len(it) > 6:
             try:
                 row["t"] = float(it[6])
@@ -179,12 +167,7 @@ def iter_klines_1m(
     timeout: int = 20,
     max_retries: int = 5,
     sleep_sec: float = 0.25,
-) -> Generator[List[Dict[str, float]], None, None]:
-    """
-    Генератор чанков 1m баров. Пагинация за счёт сдвига параметра `end` к началу окна.
-    API отдаёт список в обратном порядке (по убыванию startTime), забираем по 1000 и двигаем end.
-    Устойчив к лимитам (429/10006) через _http_get.
-    """
+) -> Generator[List[KlineRow], None, None]:
     if since.tzinfo is None:
         since = since.replace(tzinfo=timezone.utc)
     if until.tzinfo is None:
@@ -196,7 +179,7 @@ def iter_klines_1m(
     end_ms_initial = int(until.timestamp() * 1000)
 
     path = "/v5/market/kline"
-    params_base = {
+    params_base: dict[str, str | int] = {
         "category": category,
         "symbol": symbol,
         "interval": "1",
@@ -207,22 +190,20 @@ def iter_klines_1m(
     step_ms = KLINE_LIMIT * 60_000
 
     while window_end > start_ms:
-        params = dict(params_base)
+        params: dict[str, int | str] = dict(params_base)
         params["start"] = start_ms
         params["end"] = window_end
 
         r = _http_get(
             path, params, timeout=timeout, max_retries=10, backoff_base=max(sleep_sec, 0.25)
         )
-        data = r.json()
+        data: dict[str, Any] = r.json()
         if str(data.get("retCode")) != "0":
-            # сюда попадают нефатальные коды, которые _http_get не распознал как rate-limit/429
             raise RuntimeError(f"Bybit error: {data.get('retCode')} {data.get('retMsg')}")
         result = data.get("result") or {}
         lst = result.get("list") or []
 
         if not lst:
-            # Пустое окно: сдвиг назад фиксированным шагом
             new_end = max(start_ms, window_end - step_ms)
             if new_end == window_end:
                 break
@@ -232,12 +213,10 @@ def iter_klines_1m(
             time.sleep(sleep_sec)
             continue
 
-        # Отсортируем по возрастанию для корректного построения временного ряда
         lst_sorted = sorted(lst, key=lambda x: int(x[0]))
         rows = _rows_from_kline_list(lst_sorted)
         yield rows
 
-        # Новый конец окна — самая ранняя startTime текущего чанка минус 60 секунд
         earliest_start_ms = int(lst_sorted[0][0])
         if earliest_start_ms <= start_ms:
             break
@@ -258,8 +237,8 @@ def fetch_klines_1m(
     category: str = "spot",
     timeout: int = 20,
     max_retries: int = 5,
-) -> List[Dict[str, float]]:
-    acc: List[Dict[str, float]] = []
+) -> List[KlineRow]:
+    acc: List[KlineRow] = []
     for chunk in iter_klines_1m(
         symbol,
         since,
@@ -281,14 +260,10 @@ def get_launch_time(
     timeout: int = 20,
     max_retries: int = 5,
 ) -> Optional[datetime]:
-    """
-    Дата/время запуска инструмента (v5 instruments-info) для категории.
-    Возвращает tz-aware UTC или None.
-    """
     path = "/v5/market/instruments-info"
-    params = {"category": category, "symbol": symbol}
+    params: Mapping[str, str] = {"category": category, "symbol": symbol}
     r = _http_get(path, params, timeout=timeout, max_retries=max_retries)
-    data = r.json()
+    data: dict[str, Any] = r.json()
     if str(data.get("retCode")) != "0":
         return None
     result = data.get("result") or {}

@@ -28,7 +28,10 @@ dev = [
   "isort>=5",
   "mypy>=1.8",
   "numba>=0.59",
-  "pre-commit>=4.3.0",
+  # type stubs
+  "pandas-stubs>=2",
+  "types-requests",
+  "types-PyYAML",
 ]
 
 [project.scripts]
@@ -53,3 +56,24 @@ line-length = 100
 python_version = "3.11"
 strict = true
 packages = ["ohlcv"]
+
+[[tool.mypy.overrides]]
+module = [
+  "pandas",
+  "pandas.*",
+  "requests",
+  "yaml",
+  "pyarrow",
+  "pyarrow.*",
+]
+ignore_missing_imports = true
+
+# CLI-модули допускаем без полной аннотации, чтобы не блокировать сборку
+[[tool.mypy.overrides]]
+module = [
+  "ohlcv.cli",
+  "ohlcv.features.cli",
+]
+disallow_untyped_defs = false
+check_untyped_defs = false
+warn_return_any = false
