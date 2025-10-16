@@ -51,7 +51,11 @@ def main(argv=None):
     b.add_argument("--config", type=Path, default=None, help="YAML с параметрами окон (optional)")
     b.add_argument("--output", required=True, type=Path)
     b.add_argument("--build-version", default=None, help="Override f_build_version (optional)")
-    b.add_argument("--strict", action="store_true", help="строгая проверка схемы/NaN (падать при несоответствии)")
+    b.add_argument(
+        "--strict",
+        action="store_true",
+        help="строгая проверка схемы/NaN (падать при несоответствии)",
+    )
 
     args = p.parse_args(argv)
 

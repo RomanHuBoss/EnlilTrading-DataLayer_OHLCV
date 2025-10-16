@@ -17,7 +17,9 @@ class BuildMeta:
         """Версия сборки признаков на базе git-ревизии и параметров окон."""
         sha = "nogit"
         try:
-            out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL)
+            out = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+            )
             sha = out.decode().strip()
         except Exception:
             pass

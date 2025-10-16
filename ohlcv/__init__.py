@@ -11,8 +11,8 @@ try:
 except Exception:
     # На случай частичных установок без подпакета quality.
     quality_validate = None  # type: ignore
-    QualityConfig = None     # type: ignore
-    DQ_BITS = None           # type: ignore
+    QualityConfig = None  # type: ignore
+    DQ_BITS = None  # type: ignore
 
 __all__ = [
     "__version__",
@@ -20,4 +20,3 @@ __all__ = [
     "QualityConfig",
     "DQ_BITS",
 ]
-

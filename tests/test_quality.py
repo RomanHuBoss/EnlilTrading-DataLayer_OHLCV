@@ -20,7 +20,7 @@ def _mk_df(n=10, start="2024-01-01T00:00:00Z"):
 
 
 def test_validate_empty_returns_empty():
-    df = pd.DataFrame(columns=["o","h","l","c","v"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+    df = pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(pd.DatetimeIndex([], tz="UTC"))
     clean, issues = validate(df)
     assert clean.shape[0] == 0
     assert issues.shape[0] == 0
@@ -36,9 +36,11 @@ def test_fix_ohlc_invariants_and_neg_volume():
 
     clean, issues = validate(df, tf="1m", repair=True)
     # Инварианты должны быть исправлены
-    assert clean.loc[i1, "h"] >= max(clean.loc[i1, "o"], clean.loc[i1, "c"]) \
-           and clean.loc[i1, "l"] <= min(clean.loc[i1, "o"], clean.loc[i1, "c"]) \
-           and clean.loc[i1, "l"] <= clean.loc[i1, "h"]
+    assert (
+        clean.loc[i1, "h"] >= max(clean.loc[i1, "o"], clean.loc[i1, "c"])
+        and clean.loc[i1, "l"] <= min(clean.loc[i1, "o"], clean.loc[i1, "c"])
+        and clean.loc[i1, "l"] <= clean.loc[i1, "h"]
+    )
     # Объём неотрицателен
     assert clean.loc[i2, "v"] == 0.0
     # dq_flags должен быть ненулевым хотя бы на этих строках
@@ -66,23 +68,30 @@ def test_missing_small_fill_sets_is_gap_and_flags():
 def test_misaligned_timestamps_are_aligned_to_right_boundary():
     # Создадим метки, сдвинутые на +10 секунд — должны округлиться к правой границе минуты
     base = pd.Timestamp("2024-01-01T00:00:00Z")
-    idx = pd.DatetimeIndex([base + pd.Timedelta(seconds=10), base + pd.Timedelta(minutes=1, seconds=10)], tz="UTC")
-    df = pd.DataFrame({
-        "o": [100.0, 101.0],
-        "h": [101.0, 102.0],
-        "l": [99.0, 100.5],
-        "c": [100.5, 101.5],
-        "v": [1.0, 2.0],
-    }, index=idx)
+    idx = pd.DatetimeIndex(
+        [base + pd.Timedelta(seconds=10), base + pd.Timedelta(minutes=1, seconds=10)], tz="UTC"
+    )
+    df = pd.DataFrame(
+        {
+            "o": [100.0, 101.0],
+            "h": [101.0, 102.0],
+            "l": [99.0, 100.5],
+            "c": [100.5, 101.5],
+            "v": [1.0, 2.0],
+        },
+        index=idx,
+    )
 
     cfg = QualityConfig(misaligned_tolerance_seconds=1)
     clean, issues = validate(df, tf="1m", repair=True, config=cfg)
 
     # Ожидаем метки ровно на границах минут: 00:01 и 00:02 (правая граница окна)
-    assert (clean.index == pd.DatetimeIndex([
-        base + pd.Timedelta(minutes=1),
-        base + pd.Timedelta(minutes=2)
-    ], tz="UTC")).all()
+    assert (
+        clean.index
+        == pd.DatetimeIndex(
+            [base + pd.Timedelta(minutes=1), base + pd.Timedelta(minutes=2)], tz="UTC"
+        )
+    ).all()
     # Наличие issue MISALIGNED_TS
     assert (issues["code"] == "MISALIGNED_TS").any()
 
@@ -90,7 +99,10 @@ def test_misaligned_timestamps_are_aligned_to_right_boundary():
 def test_dq_notes_correspond_to_flags():
     df = _mk_df(1)
     # Сгенерируем конфликт инвариантов
-    df.loc[df.index[0], ["h", "l"]] = [df.loc[df.index[0], "o"] - 1.0, df.loc[df.index[0], "c"] + 1.0]
+    df.loc[df.index[0], ["h", "l"]] = [
+        df.loc[df.index[0], "o"] - 1.0,
+        df.loc[df.index[0], "c"] + 1.0,
+    ]
     clean, issues = validate(df, tf="1m", repair=True)
     flags = int(clean.iloc[0]["dq_flags"])
     notes = clean.iloc[0]["dq_notes"]

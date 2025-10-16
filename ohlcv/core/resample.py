@@ -10,6 +10,7 @@ import pandas as pd
 from typing import Literal, Dict
 from ..utils.timeframes import tf_to_pandas_rule
 
+
 def resample_ohlcv(df_1m: pd.DataFrame, to_tf: Literal["5m", "15m", "1h"]) -> pd.DataFrame:
     """
     Вход:

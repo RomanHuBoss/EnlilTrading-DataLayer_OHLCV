@@ -44,7 +44,11 @@ def normalize_and_validate(df: pd.DataFrame, strict: bool = False) -> pd.DataFra
     # Приведение типов
     for c, dt in EXPECTED_DTYPES.items():
         if dt == "int64":
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64").astype("int64", errors="ignore")
+            df[c] = (
+                pd.to_numeric(df[c], errors="coerce")
+                .astype("Int64")
+                .astype("int64", errors="ignore")
+            )
         elif dt.startswith("float"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
         else:

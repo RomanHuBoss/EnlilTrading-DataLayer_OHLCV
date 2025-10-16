@@ -7,24 +7,29 @@ from typing import List, Tuple
 
 # Битовые коды флагов качества (совместимо с тестами: допускаются синонимы)
 DQ_BITS = {
-    "INV_OHLC": 0,         "inv_ohlc": 0,
-    "MISSING_BARS": 1,     "gap": 1,
-    "NEG_V": 2,            "neg_v": 2,
-    "MISALIGNED_TS": 3,    "misaligned_ts": 3,
-    "MISSING_FILLED": 4,   "missing_filled": 4,
+    "INV_OHLC": 0,
+    "inv_ohlc": 0,
+    "MISSING_BARS": 1,
+    "gap": 1,
+    "NEG_V": 2,
+    "neg_v": 2,
+    "MISALIGNED_TS": 3,
+    "misaligned_ts": 3,
+    "MISSING_FILLED": 4,
+    "missing_filled": 4,
 }
 
-BIT_INV_OHLC     = DQ_BITS["INV_OHLC"]
-BIT_GAP          = DQ_BITS["MISSING_BARS"]
-BIT_NEG_V        = DQ_BITS["NEG_V"]
-BIT_MISALIGNED   = DQ_BITS["MISALIGNED_TS"]
+BIT_INV_OHLC = DQ_BITS["INV_OHLC"]
+BIT_GAP = DQ_BITS["MISSING_BARS"]
+BIT_NEG_V = DQ_BITS["NEG_V"]
+BIT_MISALIGNED = DQ_BITS["MISALIGNED_TS"]
 BIT_MISSING_FILL = DQ_BITS["MISSING_FILLED"]
 
 FLAG_TO_NOTE = {
-    BIT_INV_OHLC:     "inv_ohlc",
-    BIT_GAP:          "gap",
-    BIT_NEG_V:        "neg_v",
-    BIT_MISALIGNED:   "misaligned_ts",
+    BIT_INV_OHLC: "inv_ohlc",
+    BIT_GAP: "gap",
+    BIT_NEG_V: "neg_v",
+    BIT_MISALIGNED: "misaligned_ts",
     BIT_MISSING_FILL: "missing_filled",
 }
 
@@ -49,7 +54,9 @@ def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _align_to_right_boundary(df: pd.DataFrame, *, tf: str, tol_sec: int) -> Tuple[pd.DataFrame, np.ndarray]:
+def _align_to_right_boundary(
+    df: pd.DataFrame, *, tf: str, tol_sec: int
+) -> Tuple[pd.DataFrame, np.ndarray]:
     if df.empty or tf != "1m":
         return df, np.zeros(len(df), dtype=bool)
     right = df.index.ceil("min")
@@ -64,7 +71,9 @@ def _align_to_right_boundary(df: pd.DataFrame, *, tf: str, tol_sec: int) -> Tupl
     return out, need  # маска по старому df (для маркировки факта выравнивания)
 
 
-def _fill_small_internal_gaps(df: pd.DataFrame, *, threshold: float) -> Tuple[pd.DataFrame, np.ndarray]:
+def _fill_small_internal_gaps(
+    df: pd.DataFrame, *, threshold: float
+) -> Tuple[pd.DataFrame, np.ndarray]:
     """
     Заполнение внутренних пропусков, если доля пропусков ≤ threshold.
     Синтетика: o=h=l=c(prev_close), v=0.0, is_gap=True.
@@ -115,7 +124,7 @@ def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[dict], np.ndarray
         neg = out["v"].to_numpy() < 0.0
         if neg.any():
             out.loc[out.index[neg], "v"] = 0.0
-            flags[neg] |= (1 << BIT_NEG_V)
+            flags[neg] |= 1 << BIT_NEG_V
             for ts in out.index[neg]:
                 issues.append({"ts": ts, "code": "NEG_V", "note": "negative volume -> 0"})
 
@@ -129,7 +138,7 @@ def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[dict], np.ndarray
         l_fix = np.minimum(low_arr, np.minimum(o_arr, c_arr))
         out.loc[out.index[inv], "h"] = h_fix[inv]
         out.loc[out.index[inv], "l"] = l_fix[inv]
-        flags[inv] |= (1 << BIT_INV_OHLC)
+        flags[inv] |= 1 << BIT_INV_OHLC
         for ts in out.index[inv]:
             issues.append({"ts": ts, "code": "INV_OHLC", "note": "OHLC invariant fixed"})
 
@@ -144,12 +153,20 @@ def _notes_from_flags(flags: np.ndarray) -> List[str]:
     return notes
 
 
-def validate(df: pd.DataFrame, *, tf: str = "1m", symbol: str | None = None,
-             repair: bool = True, config: QualityConfig | None = None):
+def validate(
+    df: pd.DataFrame,
+    *,
+    tf: str = "1m",
+    symbol: str | None = None,
+    repair: bool = True,
+    config: QualityConfig | None = None,
+):
     cfg = config or QualityConfig()
     out = _ensure_utc_index(df)
 
-    out, mis_mask_old = _align_to_right_boundary(out, tf=tf, tol_sec=cfg.misaligned_tolerance_seconds)
+    out, mis_mask_old = _align_to_right_boundary(
+        out, tf=tf, tol_sec=cfg.misaligned_tolerance_seconds
+    )
 
     out, gap_mask_new = _fill_small_internal_gaps(out, threshold=cfg.missing_fill_threshold)
 
@@ -162,7 +179,9 @@ def validate(df: pd.DataFrame, *, tf: str = "1m", symbol: str | None = None,
         if aligned_pos_mask.any():
             flags = (flags | np.where(aligned_pos_mask, (1 << BIT_MISALIGNED), 0)).astype(np.int32)
             for ts in out.index[aligned_pos_mask]:
-                issues.append({"ts": ts, "code": "MISALIGNED_TS", "note": "aligned to right boundary"})
+                issues.append(
+                    {"ts": ts, "code": "MISALIGNED_TS", "note": "aligned to right boundary"}
+                )
 
     if "is_gap" in out.columns:
         gap_arr = out["is_gap"].to_numpy(dtype=bool)
@@ -181,21 +200,39 @@ def validate(df: pd.DataFrame, *, tf: str = "1m", symbol: str | None = None,
 # --- import-time self-coverage: добиваем все редкие ветви ---
 def _self_cov() -> None:
     # 0) ранние выходы
-    _empty = pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+    _empty = pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(
+        pd.DatetimeIndex([], tz="UTC")
+    )
     _align_to_right_boundary(_empty, tf="1m", tol_sec=1)
     _fill_small_internal_gaps(_empty, threshold=1.0)
     validate(_empty, tf="1m")
 
     # 1) naive → tz_localize
     idx_naive = pd.date_range("2024-01-01", periods=3, freq="min")  # naive
-    df_naive = pd.DataFrame({"o": [1.0, 2.0, 3.0], "h": [2.0, 3.0, 4.0],
-                             "l": [0.5, 1.5, 2.5], "c": [1.5, 2.5, 3.5], "v": [1.0, 1.0, 1.0]}, index=idx_naive)
+    df_naive = pd.DataFrame(
+        {
+            "o": [1.0, 2.0, 3.0],
+            "h": [2.0, 3.0, 4.0],
+            "l": [0.5, 1.5, 2.5],
+            "c": [1.5, 2.5, 3.5],
+            "v": [1.0, 1.0, 1.0],
+        },
+        index=idx_naive,
+    )
     validate(df_naive, tf="1m")
 
     # 2) tz-aware ровные минуты → not-need.any + full==len
     idx = pd.date_range("2024-01-01", periods=3, freq="min", tz="UTC")
-    df0 = pd.DataFrame({"o": [1.0, 2.0, 3.0], "h": [2.0, 3.0, 4.0],
-                        "l": [0.5, 1.5, 2.5], "c": [1.5, 2.5, 3.5], "v": [1.0, 1.0, 1.0]}, index=idx)
+    df0 = pd.DataFrame(
+        {
+            "o": [1.0, 2.0, 3.0],
+            "h": [2.0, 3.0, 4.0],
+            "l": [0.5, 1.5, 2.5],
+            "c": [1.5, 2.5, 3.5],
+            "v": [1.0, 1.0, 1.0],
+        },
+        index=idx,
+    )
     validate(df0, tf="1m")
 
     # 3) tf != 1m → ранний выход
@@ -221,13 +258,23 @@ def _self_cov() -> None:
     validate(df_has_gap, tf="1m")
 
     # 8) MISALIGNED_TS
-    idx_mis = pd.DatetimeIndex([idx[0] + pd.Timedelta(seconds=10), idx[1] + pd.Timedelta(seconds=10)], tz="UTC")
-    df_mis = pd.DataFrame({"o": [1.0, 2.0], "h": [2.0, 3.0], "l": [0.5, 1.5], "c": [1.5, 2.5], "v": [1.0, 1.0]}, index=idx_mis)
+    idx_mis = pd.DatetimeIndex(
+        [idx[0] + pd.Timedelta(seconds=10), idx[1] + pd.Timedelta(seconds=10)], tz="UTC"
+    )
+    df_mis = pd.DataFrame(
+        {"o": [1.0, 2.0], "h": [2.0, 3.0], "l": [0.5, 1.5], "c": [1.5, 2.5], "v": [1.0, 1.0]},
+        index=idx_mis,
+    )
     validate(df_mis, tf="1m", config=QualityConfig(misaligned_tolerance_seconds=1))
 
     # 9) дубликаты после ceil('min') и удаление
-    idx_dup = pd.DatetimeIndex([idx[0] + pd.Timedelta(seconds=5), idx[0] + pd.Timedelta(seconds=50)], tz="UTC")
-    df_dup = pd.DataFrame({"o": [1.0, 1.1], "h": [2.0, 2.1], "l": [0.5, 0.6], "c": [1.5, 1.6], "v": [1.0, 1.0]}, index=idx_dup)
+    idx_dup = pd.DatetimeIndex(
+        [idx[0] + pd.Timedelta(seconds=5), idx[0] + pd.Timedelta(seconds=50)], tz="UTC"
+    )
+    df_dup = pd.DataFrame(
+        {"o": [1.0, 1.1], "h": [2.0, 2.1], "l": [0.5, 0.6], "c": [1.5, 1.6], "v": [1.0, 1.0]},
+        index=idx_dup,
+    )
     validate(df_dup, tf="1m", config=QualityConfig(misaligned_tolerance_seconds=1))
 
     # 10) t-столбец в синтетике
@@ -247,7 +294,18 @@ def _self_cov() -> None:
 
     # 13) notes: пустая маска и полный набор битов
     _ = _notes_from_flags(np.array([0], dtype=np.int32))
-    _ = _notes_from_flags(np.array([(1 << BIT_INV_OHLC) | (1 << BIT_GAP) | (1 << BIT_NEG_V) | (1 << BIT_MISALIGNED) | (1 << BIT_MISSING_FILL)], dtype=np.int32))
+    _ = _notes_from_flags(
+        np.array(
+            [
+                (1 << BIT_INV_OHLC)
+                | (1 << BIT_GAP)
+                | (1 << BIT_NEG_V)
+                | (1 << BIT_MISALIGNED)
+                | (1 << BIT_MISSING_FILL)
+            ],
+            dtype=np.int32,
+        )
+    )
 
 
 _self_cov()

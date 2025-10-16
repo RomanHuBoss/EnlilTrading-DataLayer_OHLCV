@@ -211,7 +211,9 @@ def iter_klines_1m(
         params["start"] = start_ms
         params["end"] = window_end
 
-        r = _http_get(path, params, timeout=timeout, max_retries=10, backoff_base=max(sleep_sec, 0.25))
+        r = _http_get(
+            path, params, timeout=timeout, max_retries=10, backoff_base=max(sleep_sec, 0.25)
+        )
         data = r.json()
         if str(data.get("retCode")) != "0":
             # сюда попадают нефатальные коды, которые _http_get не распознал как rate-limit/429

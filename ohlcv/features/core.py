@@ -20,14 +20,18 @@ DEFAULTS = {
     "mom_windows": [20],
 }
 
+
 def _logret(close: pd.Series) -> pd.Series:
     return np.log(close / close.shift(1)).replace([np.inf, -np.inf], np.nan)
+
 
 def realized_vol(logret: pd.Series, n: int) -> pd.Series:
     return logret.rolling(n, min_periods=n).std(ddof=1)
 
+
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(alpha=1.0 / float(n), adjust=False).mean()
+
 
 def rsi_wilder(close: pd.Series, n: int) -> pd.Series:
     delta = close.diff()
@@ -39,16 +43,23 @@ def rsi_wilder(close: pd.Series, n: int) -> pd.Series:
     rsi = 100.0 - (100.0 / (1.0 + rs))
     return rsi
 
+
 def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     prev_close = close.shift(1)
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(
+        axis=1
+    )
     return tr
+
 
 def atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, n: int) -> pd.Series:
     tr = true_range(high, low, close)
     return ema(tr, n)
 
-def di_adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
+
+def di_adx(
+    high: pd.Series, low: pd.Series, close: pd.Series, n: int
+) -> Tuple[pd.Series, pd.Series, pd.Series]:
     up_move = high.diff()
     down_move = -low.diff()
     plus_dm = ((up_move > down_move) & (up_move > 0)).astype(float) * up_move.clip(lower=0.0)
@@ -60,15 +71,18 @@ def di_adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int) -> Tuple[p
     adx = ema(dx, n)
     return pdi, mdi, adx
 
+
 def donchian(high: pd.Series, low: pd.Series, n: int) -> Tuple[pd.Series, pd.Series]:
     hh = high.rolling(n, min_periods=n).max()
     ll = low.rolling(n, min_periods=n).min()
     return hh, ll
 
+
 def zscore(x: pd.Series, n: int) -> pd.Series:
     m = x.rolling(n, min_periods=n).mean()
     s = x.rolling(n, min_periods=n).std(ddof=1)
     return (x - m) / (s + EPS)
+
 
 def vwap_rolling(df: pd.DataFrame, n: int) -> pd.Series:
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
@@ -76,6 +90,7 @@ def vwap_rolling(df: pd.DataFrame, n: int) -> pd.Series:
     s_pv = pv.rolling(n, min_periods=n).sum()
     s_v = df["volume"].rolling(n, min_periods=n).sum()
     return s_pv / (s_v + EPS)
+
 
 def vwap_session(df: pd.DataFrame) -> pd.Series:
     ts = pd.to_datetime(df["start_time_iso"], utc=True)
@@ -86,11 +101,15 @@ def vwap_session(df: pd.DataFrame) -> pd.Series:
     s_v = df["volume"].groupby(day_key).cumsum()
     return s_pv / (s_v + EPS)
 
+
 def obv(close: pd.Series, vol: pd.Series) -> pd.Series:
     sign = (close.diff()).apply(lambda x: 1.0 if x > 0 else (-1.0 if x < 0 else 0.0))
     return (sign * vol).cumsum()
 
-def compute_features(df: pd.DataFrame, symbol: str, tf: str, params: Dict[str, Any] | None = None) -> pd.DataFrame:
+
+def compute_features(
+    df: pd.DataFrame, symbol: str, tf: str, params: Dict[str, Any] | None = None
+) -> pd.DataFrame:
     params = {**DEFAULTS, **(params or {})}
     strict = bool(params.get("strict", False))
 
@@ -140,13 +159,16 @@ def compute_features(df: pd.DataFrame, symbol: str, tf: str, params: Dict[str, A
     out[f"f_donch_h_{n_d}"] = hi
     out[f"f_donch_l_{n_d}"] = lo
     prev_close = close.shift(1)
-    brk = np.where((close > hi.shift(1)) & (prev_close <= hi.shift(1)), 1,
-                   np.where((close < lo.shift(1)) & (prev_close >= lo.shift(1)), -1, 0))
+    brk = np.where(
+        (close > hi.shift(1)) & (prev_close <= hi.shift(1)),
+        1,
+        np.where((close < lo.shift(1)) & (prev_close >= lo.shift(1)), -1, 0),
+    )
     out[f"f_donch_break_dir_{n_d}"] = brk
     out[f"f_donch_width_pct_{n_d}"] = (hi - lo) / (close + EPS)
 
     # Z‑scores
-    out["f_range"] = (high - low)
+    out["f_range"] = high - low
     for n in params["z_windows"]:
         out[f"f_close_z_{n}"] = zscore(close, n)
         out[f"f_range_z_{n}"] = zscore(out["f_range"], n)
@@ -166,7 +188,9 @@ def compute_features(df: pd.DataFrame, symbol: str, tf: str, params: Dict[str, A
     # VWAP
     n_vroll = int(params["vwap_roll_window"])
     out[f"f_vwap_roll_{n_vroll}"] = vwap_rolling(out, n_vroll)
-    out[f"f_vwap_dev_pct_{n_vroll}"] = (close - out[f"f_vwap_roll_{n_vroll}"]) / (out[f"f_vwap_roll_{n_vroll}"] + EPS)
+    out[f"f_vwap_dev_pct_{n_vroll}"] = (close - out[f"f_vwap_roll_{n_vroll}"]) / (
+        out[f"f_vwap_roll_{n_vroll}"] + EPS
+    )
     out["f_vwap_session"] = vwap_session(out)
     out["f_vwap_session_dev_pct"] = (close - out["f_vwap_session"]) / (out["f_vwap_session"] + EPS)
 

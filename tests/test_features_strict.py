@@ -7,15 +7,17 @@ from ohlcv.features.core import compute_features
 
 def _mk_df(n=100):
     ts = pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC")
-    df = pd.DataFrame({
-        "timestamp_ms": (ts.view("i8") // 10**6).astype("int64"),
-        "start_time_iso": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "open": np.linspace(1.0, 2.0, n),
-        "high": np.linspace(1.0, 2.0, n) + 0.1,
-        "low": np.linspace(1.0, 2.0, n) - 0.1,
-        "close": np.linspace(1.0, 2.0, n),
-        "volume": np.ones(n),
-    })
+    df = pd.DataFrame(
+        {
+            "timestamp_ms": (ts.view("i8") // 10**6).astype("int64"),
+            "start_time_iso": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "open": np.linspace(1.0, 2.0, n),
+            "high": np.linspace(1.0, 2.0, n) + 0.1,
+            "low": np.linspace(1.0, 2.0, n) - 0.1,
+            "close": np.linspace(1.0, 2.0, n),
+            "volume": np.ones(n),
+        }
+    )
     return df
 
 

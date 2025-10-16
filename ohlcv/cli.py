@@ -18,6 +18,7 @@ from .quality.validator import QualityConfig
 
 # -------------------- общие утилиты --------------------
 
+
 def _data_root(arg: str | None) -> Path:
     base = Path(arg) if arg else Path(os.environ.get("C1_DATA_ROOT", Path.cwd() / "data"))
     return base.expanduser().resolve()
@@ -26,7 +27,9 @@ def _data_root(arg: str | None) -> Path:
 def _df_from_rows(rows):
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(pd.DatetimeIndex([], tz="UTC"))
+        return pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(
+            pd.DatetimeIndex([], tz="UTC")
+        )
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     df = df.set_index("ts").sort_index()
     cols = ["o", "h", "l", "c", "v"] + (["t"] if "t" in df.columns else [])
@@ -63,7 +66,9 @@ def _hb_printer(sym: str, since: datetime, until: datetime):
     return _cb
 
 
-def _align_since_with_launch(sym: str, eff_since: datetime, category: str, spot_align_futures: bool) -> datetime:
+def _align_since_with_launch(
+    sym: str, eff_since: datetime, category: str, spot_align_futures: bool
+) -> datetime:
     """Кламп начала окна к launchTime категории; для spot опционально к мин(launchTime linear,inverse)."""
     lt = get_launch_time(sym, category=category)
     if lt and lt > eff_since:
@@ -80,15 +85,26 @@ def _align_since_with_launch(sym: str, eff_since: datetime, category: str, spot_
 
 # -------------------- команды --------------------
 
+
 def cmd_backfill(args):
     symbols = args.symbols.split(",")
     since = datetime.fromisoformat(args.since)
-    since = since.replace(tzinfo=timezone.utc) if since.tzinfo is None else since.astimezone(timezone.utc)
-    until = datetime.fromisoformat(args.until).astimezone(timezone.utc) if args.until else datetime.now(timezone.utc)
+    since = (
+        since.replace(tzinfo=timezone.utc)
+        if since.tzinfo is None
+        else since.astimezone(timezone.utc)
+    )
+    until = (
+        datetime.fromisoformat(args.until).astimezone(timezone.utc)
+        if args.until
+        else datetime.now(timezone.utc)
+    )
     since, until = since.replace(second=0, microsecond=0), until.replace(second=0, microsecond=0)
 
     data_root = _data_root(args.data_root)
-    _print(f"[cfg] data_root={str(data_root)}; category={args.category}; spot_align_futures={args.spot_align_futures}")
+    _print(
+        f"[cfg] data_root={str(data_root)}; category={args.category}; spot_align_futures={args.spot_align_futures}"
+    )
 
     for sym in symbols:
         eff_since = _align_since_with_launch(sym, since, args.category, args.spot_align_futures)
@@ -96,7 +112,9 @@ def cmd_backfill(args):
         total = int((until - eff_since).total_seconds() // 60)
         fetched = 0
         started_at = datetime.now(timezone.utc)
-        _print(f"[{sym}] backfill 1m {eff_since.isoformat()} → {until.isoformat()}  total≈{total} bars")
+        _print(
+            f"[{sym}] backfill 1m {eff_since.isoformat()} → {until.isoformat()}  total≈{total} bars"
+        )
 
         acc = []
         heartbeat = _hb_printer(sym, eff_since, until)
@@ -111,7 +129,9 @@ def cmd_backfill(args):
         ):
             acc.extend(chunk)
             fetched += len(chunk)
-            _print_progress(sym, fetched, total, datetime.fromisoformat(chunk[-1]["ts"]), started_at)
+            _print_progress(
+                sym, fetched, total, datetime.fromisoformat(chunk[-1]["ts"]), started_at
+            )
 
         _print(f"[{sym}] fetched={fetched} bars. Репарация/валидация…")
         df = _df_from_rows(acc)
@@ -136,7 +156,9 @@ def cmd_update(args):
     end = now.replace(second=0, microsecond=0)
 
     data_root = _data_root(args.data_root)
-    _print(f"[cfg] data_root={str(data_root)}; category={args.category}; spot_align_futures={args.spot_align_futures}")
+    _print(
+        f"[cfg] data_root={str(data_root)}; category={args.category}; spot_align_futures={args.spot_align_futures}"
+    )
 
     for sym in symbols:
         path = parquet_path(data_root, sym, "1m")
@@ -192,7 +214,9 @@ def cmd_quality_validate(args):
     data_root = _data_root(args.data_root)
     symbols = args.symbols.split(",")
     tf = args.tf
-    _print(f"[cfg] data_root={str(data_root)}; tf={tf}; write={args.write}; issues_csv={args.issues}; issues_parquet={args.issues_parquet}")
+    _print(
+        f"[cfg] data_root={str(data_root)}; tf={tf}; write={args.write}; issues_csv={args.issues}; issues_parquet={args.issues_parquet}"
+    )
 
     cfg = QualityConfig(
         missing_fill_threshold=args.miss_fill_threshold,
@@ -230,10 +254,9 @@ def cmd_quality_validate(args):
         n_issues = 0 if issues is None else len(issues)
         _print(f"[{sym}] summary: rows_in={total} rows_out={total_clean} issues={n_issues}")
 
-        summary_rows.append({
-            "symbol": sym, "tf": tf,
-            "rows_in": total, "rows_out": total_clean, "issues": n_issues
-        })
+        summary_rows.append(
+            {"symbol": sym, "tf": tf, "rows_in": total, "rows_out": total_clean, "issues": n_issues}
+        )
 
     # Внешние артефакты (C2): issues.{csv,parquet} и quality_summary.{csv,json}
     if all_issues:
@@ -296,14 +319,16 @@ def cmd_report_missing(args):
         full = pd.date_range(df.index.min(), df.index.max(), freq=freq, tz="UTC")
         missing = full.difference(df.index)
 
-        out_rows.append({
-            "symbol": sym,
-            "tf": args.tf,
-            "bars": len(full),
-            "present": len(df),
-            "missing": len(missing),
-            "missing_rate": 1.0 - (len(df) / len(full)),
-        })
+        out_rows.append(
+            {
+                "symbol": sym,
+                "tf": args.tf,
+                "bars": len(full),
+                "present": len(df),
+                "missing": len(missing),
+                "missing_rate": 1.0 - (len(df) / len(full)),
+            }
+        )
 
     out_path = Path(args.out).expanduser().resolve()
     pd.DataFrame(out_rows).to_csv(out_path, index=False)
@@ -311,6 +336,7 @@ def cmd_report_missing(args):
 
 
 # -------------------- точка входа --------------------
+
 
 def main():
     p = argparse.ArgumentParser(prog="c1-ohlcv")
@@ -320,37 +346,78 @@ def main():
     b.add_argument("--symbols", required=True, help="CSV тикеров, пример: BTCUSDT,ETHUSDT")
     b.add_argument("--since", required=True, help="ISO дата начала (UTC)")
     b.add_argument("--until", required=False, help="ISO дата окончания (UTC)")
-    b.add_argument("--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT")
-    b.add_argument("--category", required=False, choices=["spot", "linear", "inverse"], default="spot")
-    b.add_argument("--spot-align-futures", action="store_true", help="Для spot: сдвигать окно к дате запуска фьючерса")
+    b.add_argument(
+        "--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT"
+    )
+    b.add_argument(
+        "--category", required=False, choices=["spot", "linear", "inverse"], default="spot"
+    )
+    b.add_argument(
+        "--spot-align-futures",
+        action="store_true",
+        help="Для spot: сдвигать окно к дате запуска фьючерса",
+    )
     b.set_defaults(func=cmd_backfill)
 
     u = sub.add_parser("update", help="Обновление хвоста 1m до текущего времени - 1 бар")
     u.add_argument("--symbols", required=True)
-    u.add_argument("--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT")
-    u.add_argument("--category", required=False, choices=["spot", "linear", "inverse"], default="spot")
-    u.add_argument("--spot-align-futures", action="store_true", help="Для spot: сдвигать старт к дате запуска фьючерса")
+    u.add_argument(
+        "--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT"
+    )
+    u.add_argument(
+        "--category", required=False, choices=["spot", "linear", "inverse"], default="spot"
+    )
+    u.add_argument(
+        "--spot-align-futures",
+        action="store_true",
+        help="Для spot: сдвигать старт к дате запуска фьючерса",
+    )
     u.set_defaults(func=cmd_update)
 
     r = sub.add_parser("resample", help="Ресемплинг из 1m в 5m/15m/1h")
     r.add_argument("--symbols", required=True)
     r.add_argument("--from-tf", required=True, choices=["1m"])
     r.add_argument("--to-tf", required=True, choices=["5m", "15m", "1h"])
-    r.add_argument("--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT")
+    r.add_argument(
+        "--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT"
+    )
     r.set_defaults(func=cmd_resample)
 
     q = sub.add_parser("quality-validate", help="C2 DataQuality: валидация и санитайз Parquet")
     q.add_argument("--symbols", required=True, help="CSV тикеров")
     q.add_argument("--tf", required=True, choices=["1m", "5m", "15m", "1h"])
-    q.add_argument("--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT")
+    q.add_argument(
+        "--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT"
+    )
     q.add_argument("--write", action="store_true", help="Перезаписать очищенный файл Parquet")
-    q.add_argument("--issues", required=False, help="Путь для CSV-журнала проблем; append по умолчанию")
-    q.add_argument("--issues-parquet", required=False, help="Путь для Parquet-журнала проблем; перезапись")
-    q.add_argument("--quality-summary-csv", required=False, help="Путь для сводного CSV по качеству; append по умолчанию")
-    q.add_argument("--quality-summary-json", required=False, help="Путь для сводного JSON по качеству; перезапись")
-    q.add_argument("--truncate", action="store_true", help="Сначала очистить целевые CSV перед записью")
-    q.add_argument("--no-repair", action="store_true", help="Только диагностировать, без автоправок")
-    q.add_argument("--miss-fill-threshold", type=float, default=0.0001, help="Порог заполнения пропусков для 1m")
+    q.add_argument(
+        "--issues", required=False, help="Путь для CSV-журнала проблем; append по умолчанию"
+    )
+    q.add_argument(
+        "--issues-parquet", required=False, help="Путь для Parquet-журнала проблем; перезапись"
+    )
+    q.add_argument(
+        "--quality-summary-csv",
+        required=False,
+        help="Путь для сводного CSV по качеству; append по умолчанию",
+    )
+    q.add_argument(
+        "--quality-summary-json",
+        required=False,
+        help="Путь для сводного JSON по качеству; перезапись",
+    )
+    q.add_argument(
+        "--truncate", action="store_true", help="Сначала очистить целевые CSV перед записью"
+    )
+    q.add_argument(
+        "--no-repair", action="store_true", help="Только диагностировать, без автоправок"
+    )
+    q.add_argument(
+        "--miss-fill-threshold",
+        type=float,
+        default=0.0001,
+        help="Порог заполнения пропусков для 1m",
+    )
     q.add_argument("--spike-window", type=int, default=200, help="Окно MAD-детектора всплесков")
     q.add_argument("--spike-k", type=float, default=12.0, help="Порог MAD-критерия")
     q.add_argument("--flat-streak", type=int, default=300, help="Длина серии нулевого объёма")
@@ -360,7 +427,9 @@ def main():
     rep.add_argument("--symbols", required=True)
     rep.add_argument("--tf", required=True, choices=["1m", "5m", "15m", "1h"])
     rep.add_argument("--out", required=True)
-    rep.add_argument("--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT")
+    rep.add_argument(
+        "--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT"
+    )
     rep.set_defaults(func=cmd_report_missing)
 
     args = p.parse_args()
