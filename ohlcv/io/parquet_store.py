@@ -13,7 +13,7 @@ import os
 import json
 import hashlib
 from pathlib import Path
-from typing import List
+from typing import List, Iterable
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -33,20 +33,41 @@ PARQUET_ROW_GROUP_SIZE = 256_000  # ориентир, может быть ско
 
 # ---- Вспомогательные утилиты -------------------------------------------------
 
+OPTIONAL_ALLOWED = ("t", "is_gap", "dq_flags", "dq_notes")
+
 
 def _optional_cols(df: pd.DataFrame) -> List[str]:
-    """
-    Разрешённые опциональные столбцы:
-      - t          : turnover
-      - is_gap     : флаг синтетического бара (календаризация)
-      - dq_flags   : битовая маска правил DataQuality (C2)
-      - dq_notes   : текстовые пометки DataQuality (C2)
-    """
     cols: List[str] = []
-    for c in ("t", "is_gap", "dq_flags", "dq_notes"):
+    for c in OPTIONAL_ALLOWED:
         if c in df.columns:
             cols.append(c)
     return cols
+
+
+def _ensure_optional_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    """Гарантированно добавить опциональные колонки с детерминированными значениями и типами."""
+    out = df.copy()
+    for c in columns:
+        if c not in out.columns:
+            if c == "t":
+                out[c] = 0.0
+            elif c == "is_gap":
+                out[c] = False
+            elif c == "dq_flags":
+                out[c] = np.int32(0)
+            elif c == "dq_notes":
+                out[c] = ""
+    # Приведение типов — важно для стабильного хэша и записи
+    if "t" in out.columns:
+        out["t"] = out["t"].astype("float64")
+    if "is_gap" in out.columns:
+        # допускаем NaN → False
+        out["is_gap"] = out["is_gap"].fillna(False).astype("bool")
+    if "dq_flags" in out.columns:
+        out["dq_flags"] = out["dq_flags"].fillna(0).astype("int32")
+    if "dq_notes" in out.columns:
+        out["dq_notes"] = out["dq_notes"].fillna("").astype("string")
+    return out
 
 
 def _stable_hash(df: pd.DataFrame) -> str:
@@ -54,31 +75,30 @@ def _stable_hash(df: pd.DataFrame) -> str:
     Стабильный хэш содержимого данных (индекс+обязательные+опциональные столбцы).
     Хэш считается по байтовому представлению:
       index (ns, int64), o,h,l,c,v (float64), затем по мере наличия t,is_gap,dq_flags,dq_notes.
+    Допуски: отсутствующие опциональные колонки считаются как нули/пусто.
     """
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("Ожидается DatetimeIndex в качестве индекса")
-    # Порядок столбцов
-    cols = ["o", "h", "l", "c", "v"] + _optional_cols(df)
-    work = df[cols].copy()
 
-    # Приведение типов к стабильным для хэша
+    # Полный набор опциональных колонок, присутствующих в df
+    opt_cols = _optional_cols(df)
+    work = df[["o", "h", "l", "c", "v"] + opt_cols].copy()
+
+    # Приведение типов к стабильным для хэша и заполнение пропусков
     idx_ns = df.index.view("i8")  # ns int64
     buf_parts: List[bytes] = [idx_ns.tobytes()]
 
-    # Числовые
     for c in ["o", "h", "l", "c", "v"]:
         buf_parts.append(np.asarray(work[c].astype("float64").values).tobytes())
 
-    # Опциональные
     if "t" in work.columns:
-        buf_parts.append(np.asarray(work["t"].astype("float64").values).tobytes())
+        buf_parts.append(np.asarray(work["t"].fillna(0.0).astype("float64").values).tobytes())
     if "is_gap" in work.columns:
-        # приведение к uint8
-        buf_parts.append(np.asarray(work["is_gap"].astype("uint8").values).tobytes())
+        # NaN → False
+        buf_parts.append(np.asarray(work["is_gap"].fillna(False).astype("uint8").values).tobytes())
     if "dq_flags" in work.columns:
-        buf_parts.append(np.asarray(work["dq_flags"].astype("int32").values).tobytes())
+        buf_parts.append(np.asarray(work["dq_flags"].fillna(0).astype("int32").values).tobytes())
     if "dq_notes" in work.columns:
-        # Преобразуем к bytes построчно с разделителем \0 (детерминированно)
         notes_bytes = b"\0".join(
             ("" if pd.isna(x) else str(x)).encode("utf-8") for x in work["dq_notes"].values
         )
@@ -91,23 +111,17 @@ def _stable_hash(df: pd.DataFrame) -> str:
 
 
 def _to_pa_table(df: pd.DataFrame, symbol: str, tf: str) -> pa.Table:
-    """
-    Преобразование в pyarrow.Table с нужной схемой и метаданными.
-    ts переносим в колонку; ожидается tz-aware UTC.
-    """
+    """Преобразование в pyarrow.Table с нужной схемой и метаданными."""
     if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
         raise ValueError("Ожидается tz-aware UTC DatetimeIndex")
 
-    # Базовые и опциональные колонки
     cols = ["o", "h", "l", "c", "v"] + _optional_cols(df)
 
-    # Сброс индекса в колонку ts (ISO8401 сохраняется через pandas→arrow как timestamp[ns, UTC])
     tbl = pa.Table.from_pandas(
         df.reset_index().rename(columns={"index": "ts"})[["ts"] + cols],
         preserve_index=False,
     )
 
-    # Метаданные
     md = dict(tbl.schema.metadata or {})
     meta = {
         "symbol": symbol,
@@ -133,9 +147,10 @@ def write_idempotent(root: Path, symbol: str, tf: str, df_new: pd.DataFrame) -> 
     """
     Идемпотентная запись Parquet:
       1) Чтение существующего файла (если есть).
-      2) Объединение по индексу ts; при дубликатах побеждают новые значения.
-      3) Сортировка по времени; удаление дублей.
-      4) Запись единого Parquet с ZSTD и метаданными.
+      2) Выравнивание состава колонок между старым и новым фреймом.
+      3) Объединение по индексу ts; при дубликатах побеждают новые значения.
+      4) Сортировка по времени; удаление дублей.
+      5) Запись Parquet с ZSTD и метаданными.
 
     Предполагаемый индекс df_new: tz-aware UTC DatetimeIndex, правые границы бара.
     """
@@ -143,35 +158,47 @@ def write_idempotent(root: Path, symbol: str, tf: str, df_new: pd.DataFrame) -> 
     path = parquet_path(root, symbol, tf)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Лок на время MERGE+WRITE
     lock = FileLock(str(path) + ".lock")
     with lock:
-        # Загрузка старых данных (если файл существует)
+        # Загрузка старых данных (если есть)
         if path.exists():
             old_tbl = pq.read_table(path)
             old = old_tbl.to_pandas()
-            # Приведение ts к UTC Timestamp
             old["ts"] = pd.to_datetime(old["ts"], utc=True)
             old = old.set_index("ts").sort_index()
         else:
             old = None
 
-        # Приведение новых данных к унифицированной форме и сортировка
-        keep_cols = ["o", "h", "l", "c", "v"] + _optional_cols(df_new)
-        df = df_new.copy()[keep_cols]
-        if not isinstance(df.index, pd.DatetimeIndex):
+        # Подготовка новых данных
+        if not isinstance(df_new.index, pd.DatetimeIndex):
             raise ValueError("Ожидается DatetimeIndex в качестве индекса")
-        if df.index.tz is None:
-            # Защита от случайного наивного индекса
-            df.index = df.index.tz_localize("UTC")
-        df = df.sort_index()
+        if df_new.index.tz is None:
+            df_new = df_new.copy()
+            df_new.index = df_new.index.tz_localize("UTC")
+        df_new = df_new.sort_index()
 
-        # Объединение
-        if old is not None and not old.empty:
-            df = pd.concat([old, df])
+        # Базовые и опциональные колонки
+        base_cols = ["o", "h", "l", "c", "v"]
+        new_opt = set(_optional_cols(df_new))
+        old_opt = set(_optional_cols(old)) if old is not None else set()
+        union_opt = sorted(
+            (new_opt | old_opt),
+            key=lambda x: OPTIONAL_ALLOWED.index(x) if x in OPTIONAL_ALLOWED else 999,
+        )
 
-        # Удаление дублей и окончательная сортировка
+        # Приведение состава и типов
+        df_new2 = _ensure_optional_columns(df_new[base_cols + list(new_opt)], union_opt)
+        if old is not None:
+            old2 = _ensure_optional_columns(old[base_cols + list(old_opt)], union_opt)
+            df = pd.concat([old2, df_new2], axis=0)
+        else:
+            df = df_new2
+
+        # Удаление дублей и окончательная сортировка: новые побеждают
         df = df[~df.index.duplicated(keep="last")].sort_index()
+
+        # Защита от NaN в опциональных после конкатенации
+        df = _ensure_optional_columns(df, union_opt)
 
         # Формирование и запись Parquet
         tbl = _to_pa_table(df, symbol, tf)
