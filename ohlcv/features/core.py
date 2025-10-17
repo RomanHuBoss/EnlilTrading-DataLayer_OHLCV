@@ -154,12 +154,16 @@ def compute_features(
     out["symbol"] = str(symbol) if symbol is not None else ""
     out["tf"] = str(tf) if tf is not None else ""
 
-    # Первая валидная строка по всем f_*
-    fcols = [c for c in out.columns if c.startswith("f_")]
-    first_valid = 0
-    if fcols:
-        mask = out[fcols].notna().all(axis=1)
-        first_valid = int(np.argmax(mask.values)) if mask.any() else len(out)
-    out["f_valid_from"] = first_valid
+    # Минимальная длина «прогрева» для валидности всех фич — максимум окон
+    warmup = max(
+        int(max(cfg["rv_windows"])),
+        int(max(cfg["z_windows"])),
+        int(max(cfg["ema_windows"])),
+        int(max(cfg["sma_windows"])),
+        int(cfg["donch_window"]),
+        int(cfg["atr_window"]),
+        int(cfg["adx_window"]),
+    )
+    out["f_valid_from"] = int(warmup)
 
     return out
