@@ -5,10 +5,9 @@ from importlib.metadata import version as _pkg_version
 
 
 def _get_version() -> str:
-    # 1) локальная сборка может положить ohlcv/version.py c __version__
+    # 1) локальная сборка может положить ohlcv/version.py с __version__
     try:
-        from .version import __version__ as v  # type: ignore[no-redef]
-
+        from .version import __version__ as v  # noqa: F401
         return str(v)
     except Exception:
         pass
