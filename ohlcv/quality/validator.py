@@ -12,8 +12,8 @@ DQ_BITS: Dict[str, int] = {
     "inv_ohlc": 0,
     "MISSING_BARS": 1,
     "gap": 1,
-    "MISSING": 1,   # нужен для тестов
-    "missing": 1,   # синоним
+    "MISSING": 1,  # нужен для тестов
+    "missing": 1,  # синоним
     "NEG_V": 2,
     "neg_v": 2,
     "MISALIGNED_TS": 3,
