@@ -95,11 +95,10 @@ def _to_pa_table(df: pd.DataFrame, symbol: str, tf: str) -> pa.Table:
         if c in {"ts", "o", "h", "l", "c", "v", "t", "is_gap"}:
             continue
         arrays.append((c, pa.array(df[c])))
-    schema = pa.schema([pa.field(name, arr.type) for name, arr in arrays])
+
     tbl = pa.Table.from_arrays(
         [arr for _, arr in arrays],
         names=[name for name, _ in arrays],
-        schema=schema,
     )
     md = {"c1.meta": _meta_blob(symbol, tf, df)}
     tbl = tbl.replace_schema_metadata(md)
@@ -128,8 +127,7 @@ def write_idempotent(root: Path | str, symbol: str, tf: str, df: pd.DataFrame) -
         df = df.reindex(columns=all_cols)
         old = old.reindex(columns=all_cols)
         merged = old.combine_first(df)
-        # keep old where new is NaN; then update with new to make new rows win
-        merged.update(df)
+        merged.update(df)  # новые значения побеждают в коллизиях
         out = merged.sort_index()
     else:
         out = df
