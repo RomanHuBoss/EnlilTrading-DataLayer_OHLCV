@@ -1,19 +1,23 @@
 from __future__ import annotations
 
-# Версия пакета — максимально надёжное получение.
-try:
-    # Локальный модуль, если присутствует (генерируемый при сборке).
-    from .version import __version__  # type: ignore[attr-defined]
-except Exception:
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
+
+def _get_version() -> str:
+    # 1) локальная сборка может положить ohlcv/version.py c __version__
     try:
-        # Установленное имя дистрибутива из pyproject.toml
-        from importlib.metadata import PackageNotFoundError, version
+        from .version import __version__ as v  # type: ignore[no-redef]
 
-        try:
-            __version__ = version("ohlcv-pipeline")  # type: ignore[assignment]
-        except PackageNotFoundError:
-            __version__ = "0.0.0"  # type: ignore[assignment]
-    except Exception:  # крайний fallback
-        __version__ = "0.0.0"  # type: ignore[assignment]
+        return str(v)
+    except Exception:
+        pass
+    # 2) установленный дистрибутив
+    try:
+        return _pkg_version("ohlcv-pipeline")
+    except PackageNotFoundError:
+        return "0.0.0"
 
+
+__version__ = _get_version()
 __all__ = ["__version__"]
