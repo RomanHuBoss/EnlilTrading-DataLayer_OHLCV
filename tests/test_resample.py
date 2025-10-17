@@ -3,11 +3,7 @@ import pandas as pd
 import pytest
 
 from ohlcv.core.resample import resample_ohlcv
-from ohlcv.core.validate import (
-    ensure_missing_threshold,
-    missing_rate,
-    validate_1m_index,
-)
+from ohlcv.core.validate import ensure_missing_threshold, missing_rate, validate_1m_index
 
 
 def _mk_df(n: int, start: str = "2024-01-01T00:00:00Z") -> pd.DataFrame:
@@ -22,28 +18,23 @@ def _mk_df(n: int, start: str = "2024-01-01T00:00:00Z") -> pd.DataFrame:
 
 def test_validate_1m_index_ok() -> None:
     df = _mk_df(10)
-    # не бросает исключение на корректном минутном индексе
     validate_1m_index(df)
 
 
 def test_resample_basic_to_5m() -> None:
     df = _mk_df(10)
     out = resample_ohlcv(df, "5m")
-    # 10 минут при окне 5m и политике label="right", closed="left" → 2 бара
     assert out.shape[0] == 2
-    # Проверка набора колонок
     assert set(out.columns) == {"o", "h", "l", "c", "v"}
-    # Базовая монотонность и tz-aware
     assert isinstance(out.index, pd.DatetimeIndex) and out.index.tz is not None
     assert out.index.is_monotonic_increasing
 
 
 def test_missing_threshold() -> None:
     df = _mk_df(100)
-    # удалим 10 последовательных минут (≈10%)
     drop_idx = df.index[10:20]
     df = df.drop(drop_idx)
     r = missing_rate(df)
-    assert 0.09 < r < 0.11  # около 0.10
+    assert 0.09 < r < 0.11
     with pytest.raises(ValueError):
-        ensure_missing_threshold(df, threshold=0.05)  # 5% порог — должно упасть
+        ensure_missing_threshold(df, threshold=0.05)
