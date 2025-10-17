@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ohlcv-pipeline"
-version = "0.3.0"
+version = "0.3.1"
 description = "OHLCV pipeline: C1 (DataLayer), C2 (DataQuality), C3 (Features.Core)"
 readme = "README.md"
-authors = [ { name = "Project" } ]
+authors = [{ name = "Project" }]
 license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
@@ -23,21 +23,18 @@ dependencies = [
 dev = [
   "pytest>=7",
   "pytest-cov>=4",
-  "ruff>=0.5",
-  "black>=24",
-  "isort>=5",
+  "ruff>=0.6.8",
+  "black>=24.8.0",
+  "isort>=5.13.2",
   "mypy>=1.8",
   "numba>=0.59",
-  # type stubs
   "pandas-stubs>=2",
   "types-requests",
   "types-PyYAML",
 ]
 
 [project.scripts]
-# существующий CLI C1
 c1-ohlcv = "ohlcv.cli:main"
-# новый CLI C3
 features-core = "ohlcv.features.cli:main"
 
 [tool.pytest.ini_options]
@@ -45,12 +42,19 @@ addopts = "-q"
 
 [tool.black]
 line-length = 100
+target-version = ["py311"]
 
 [tool.isort]
 profile = "black"
+line_length = 100
+known_first_party = ["ohlcv"]
 
 [tool.ruff]
 line-length = 100
+src = ["ohlcv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -68,7 +72,6 @@ module = [
 ]
 ignore_missing_imports = true
 
-# CLI-модули допускаем без полной аннотации, чтобы не блокировать сборку
 [[tool.mypy.overrides]]
 module = [
   "ohlcv.cli",

@@ -1,0 +1,25 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.6.8 isort==5.13.2 black==24.8.0
+      - name: Auto-fix imports and format
+        run: |
+          isort . --profile black --filter-files
+          black .
+      - name: Ruff lint (fail if still issues)
+        run: ruff check .
