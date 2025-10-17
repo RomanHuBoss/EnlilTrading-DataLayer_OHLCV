@@ -6,6 +6,7 @@
 - ZSTD compression, reasonable row group size.
 - Note: "ts" is stored as a column (not as index). Input df index must be tz-aware UTC.
 """
+
 from __future__ import annotations
 
 import hashlib

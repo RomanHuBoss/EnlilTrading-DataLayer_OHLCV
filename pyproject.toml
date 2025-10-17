@@ -51,10 +51,13 @@ known_first_party = ["ohlcv"]
 
 [tool.ruff]
 line-length = 100
-src = ["ohlcv"]
+src = ["ohlcv", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ohlcv"]
 
 [tool.mypy]
 python_version = "3.11"

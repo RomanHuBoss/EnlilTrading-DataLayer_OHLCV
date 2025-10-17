@@ -8,6 +8,7 @@
 - Агрегации: o=first, h=max, l=min, c=last, v=sum, t=sum, is_gap=max (если есть).
 - Выход: индекс — правая граница целевого ТФ; порядок столбцов: o,h,l,c,v,(t?),(is_gap?).
 """
+
 from typing import Dict, Literal
 
 import pandas as pd

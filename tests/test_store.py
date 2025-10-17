@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-from ohlcv.io.parquet_store import parquet_path, write_idempotent
+from ohlcv.io.parquet_store import write_idempotent
 
 
 def _mk_df(n: int, start: str = "2024-01-01T00:00:00Z") -> pd.DataFrame:
@@ -28,34 +28,27 @@ def test_write_and_merge(tmp_path: Path) -> None:
 
     read1 = pd.read_parquet(out1)
     assert read1.shape[0] == 10
-    # ts должен быть колонкой
     assert "ts" in read1.columns
 
-    # Пересекающееся окно: новые строки должны победить в коллизиях по ts
     df2 = _mk_df(10, "2024-01-01T00:05:00Z").copy()
-    df2["c"] = df2["c"] + 1.0  # изменим close для проверки приоритета новых данных
+    df2["c"] = df2["c"] + 1.0
     out2 = write_idempotent(root, sym, tf, df2)
     assert out2 == out1
 
     read2 = pd.read_parquet(out2)
     assert read2.shape[0] == 15
 
-    # Проверка приоритета новых данных на пересечении
-    ts_overlap = pd.Timestamp("2024-01-01T00:10:00Z", tz="UTC")  # правая граница 5-й строки df1
-    # Выберем любой ts из пересечения (например, 00:10Z входит в df2)
+    ts_overlap = pd.Timestamp("2024-01-01T00:10:00Z", tz="UTC")
     row = read2.loc[read2["ts"] == ts_overlap]
     assert not row.empty
-    # close должен совпасть с df2 (он был сдвинут на +1.0)
-    # Найдём соответствующее значение из df2
+
     df2_ts = df2.reset_index().rename(columns={"index": "ts"})
     df2_ts["ts"] = pd.to_datetime(df2_ts["ts"], utc=True)
     expected_close = float(df2_ts.loc[df2_ts["ts"] == ts_overlap, "c"].iloc[0])
     assert abs(float(row["c"].iloc[0]) - expected_close) < 1e-12
 
-    # Метаданные Parquet содержат ключ "c1.meta"
     md = pq.read_table(out2).schema.metadata or {}
     assert b"c1.meta" in md
 
-    # Порядок ключевых колонок: ts, o, h, l, c, v (+ опциональные хвостом)
     cols = list(read2.columns)
-    assert cols[:6] == ["ts", "o", "h", "l", "c", "v"]  # базовые первые
+    assert cols[:6] == ["ts", "o", "h", "l", "c", "v"]
