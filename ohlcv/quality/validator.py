@@ -6,11 +6,14 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+# Карта битов флагов качества + синонимы для обратной совместимости
 DQ_BITS: Dict[str, int] = {
     "INV_OHLC": 0,
     "inv_ohlc": 0,
     "MISSING_BARS": 1,
     "gap": 1,
+    "MISSING": 1,   # нужен для тестов
+    "missing": 1,   # синоним
     "NEG_V": 2,
     "neg_v": 2,
     "MISALIGNED_TS": 3,
@@ -36,7 +39,9 @@ FLAG_TO_NOTE: Dict[int, str] = {
 
 @dataclass
 class QualityConfig:
+    # Допустимая доля пропусков для автозаполнения внутренних минут
     missing_fill_threshold: float = 0.0001
+    # Допустимое отклонение (в секундах) для выравнивания к правой границе минуты
     misaligned_tolerance_seconds: int = 1
 
 
@@ -74,6 +79,7 @@ def _align_to_right_boundary(
 def _fill_small_internal_gaps(
     df: pd.DataFrame, *, threshold: float
 ) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Вернёт (df_с_полным_диапазоном, mask_is_gap)."""
     if df.empty:
         return df, np.zeros(0, dtype=bool)
     start, end = df.index.min(), df.index.max()
@@ -115,6 +121,7 @@ def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict[str, Any]], 
     flags = np.zeros(n, dtype=np.int32)
     issues: List[Dict[str, Any]] = []
 
+    # Отрицательный объём → 0
     if "v" in out.columns:
         neg = out["v"].to_numpy() < 0.0
         if neg.any():
@@ -123,6 +130,7 @@ def _apply_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict[str, Any]], 
             for ts in out.index[neg]:
                 issues.append({"ts": ts, "code": "NEG_V", "note": "negative volume -> 0"})
 
+    # Инварианты OHLC
     o_arr = out["o"].to_numpy()
     h_arr = out["h"].to_numpy()
     low_arr = out["l"].to_numpy()
@@ -159,14 +167,18 @@ def validate(
     cfg = config or QualityConfig()
     out = _ensure_utc_index(df)
 
+    # Выравнивание к правой границе минуты
     out, mis_mask_old = _align_to_right_boundary(
         out, tf=tf, tol_sec=cfg.misaligned_tolerance_seconds
     )
 
+    # Заполнение небольших внутренних разрывов
     out, gap_mask_new = _fill_small_internal_gaps(out, threshold=cfg.missing_fill_threshold)
 
+    # Правки инвариантов/объёма
     out, issues, flags = _apply_rules(out)
 
+    # Проставить флаг MISALIGNED_TS + issues для тех, кто реально сдвинулся
     if len(mis_mask_old) == len(df) and mis_mask_old.any():
         aligned_right = df.index.ceil("min")
         mis_right = aligned_right[mis_mask_old]
@@ -178,10 +190,15 @@ def validate(
                     {"ts": ts, "code": "MISALIGNED_TS", "note": "aligned to right boundary"}
                 )
 
+    # Проставить флаги/заметки и issues по вставленным барам (MISSING)
     if "is_gap" in out.columns:
         gap_arr = out["is_gap"].to_numpy(dtype=bool)
         if gap_arr.any():
             flags = (flags | np.where(gap_arr, (1 << BIT_GAP), 0)).astype(np.int32)
+            # Добавляем явные issue-записи с кодом "MISSING" (ожидается тестами)
+            for ts in out.index[gap_arr]:
+                issues.append({"ts": ts, "code": "MISSING", "note": "synthetic minute inserted"})
+        # Отметка "MISSING_FILLED" — отдельный бит для телеметрии (если именно мы заполнили)
         if gap_mask_new.shape == flags.shape and gap_mask_new.any():
             flags = (flags | np.where(gap_mask_new, (1 << BIT_MISSING_FILL), 0)).astype(np.int32)
 
@@ -189,103 +206,5 @@ def validate(
     out["dq_notes"] = _notes_from_flags(flags)
 
     issues_df = pd.DataFrame(issues, columns=["ts", "code", "note"])
+    issues_df = issues_df.sort_values("ts").reset_index(drop=True)
     return out, issues_df
-
-
-def _self_cov() -> None:
-    _empty = pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(
-        pd.DatetimeIndex([], tz="UTC")
-    )
-    _align_to_right_boundary(_empty, tf="1m", tol_sec=1)
-    _fill_small_internal_gaps(_empty, threshold=1.0)
-    validate(_empty, tf="1m")
-
-    idx_naive = pd.date_range("2024-01-01", periods=3, freq="min")
-    df_naive = pd.DataFrame(
-        {
-            "o": [1.0, 2.0, 3.0],
-            "h": [2.0, 3.0, 4.0],
-            "l": [0.5, 1.5, 2.5],
-            "c": [1.5, 2.5, 3.5],
-            "v": [1.0, 1.0, 1.0],
-        },
-        index=idx_naive,
-    )
-    validate(df_naive, tf="1m")
-
-    idx = pd.date_range("2024-01-01", periods=3, freq="min", tz="UTC")
-    df0 = pd.DataFrame(
-        {
-            "o": [1.0, 2.0, 3.0],
-            "h": [2.0, 3.0, 4.0],
-            "l": [0.5, 1.5, 2.5],
-            "c": [1.5, 2.5, 3.5],
-            "v": [1.0, 1.0, 1.0],
-        },
-        index=idx,
-    )
-    validate(df0, tf="1m")
-
-    validate(df0, tf="5m")
-
-    df_neg = df0.copy()
-    df_neg.loc[idx[1], "v"] = -1.0
-    validate(df_neg, tf="1m")
-
-    df_inv = df0.copy()
-    df_inv.loc[idx[2], ["h", "l"]] = [df_inv.loc[idx[2], "o"] - 1.0, df_inv.loc[idx[2], "c"] + 1.0]
-    validate(df_inv, tf="1m")
-
-    df_gap = df0.drop(idx[1])
-    validate(df_gap, tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
-
-    df_has_gap = df0.copy()
-    df_has_gap["is_gap"] = False
-    validate(df_has_gap, tf="1m")
-
-    idx_mis = pd.DatetimeIndex(
-        [idx[0] + pd.Timedelta(seconds=10), idx[1] + pd.Timedelta(seconds=10)], tz="UTC"
-    )
-    df_mis = pd.DataFrame(
-        {"o": [1.0, 2.0], "h": [2.0, 3.0], "l": [0.5, 1.5], "c": [1.5, 2.5], "v": [1.0, 1.0]},
-        index=idx_mis,
-    )
-    validate(df_mis, tf="1m", config=QualityConfig(misaligned_tolerance_seconds=1))
-
-    idx_dup = pd.DatetimeIndex(
-        [idx[0] + pd.Timedelta(seconds=5), idx[0] + pd.Timedelta(seconds=50)], tz="UTC"
-    )
-    df_dup = pd.DataFrame(
-        {"o": [1.0, 1.1], "h": [2.0, 2.1], "l": [0.5, 0.6], "c": [1.5, 1.6], "v": [1.0, 1.0]},
-        index=idx_dup,
-    )
-    validate(df_dup, tf="1m", config=QualityConfig(misaligned_tolerance_seconds=1))
-
-    df_t = df0.copy()
-    df_t["t"] = [0.1, 0.2, 0.3]
-    validate(df_t.drop(df_t.index[1]), tf="1m", config=QualityConfig(missing_fill_threshold=1.0))
-
-    df_skip = df0.drop(idx[1])
-    validate(df_skip, tf="1m", config=QualityConfig(missing_fill_threshold=0.0))
-
-    try:
-        _ensure_utc_index(pd.DataFrame({"o": [1.0]}, index=[1]))
-    except ValueError:
-        pass
-
-    _ = _notes_from_flags(np.array([0], dtype=np.int32))
-    _ = _notes_from_flags(
-        np.array(
-            [
-                (1 << BIT_INV_OHLC)
-                | (1 << BIT_GAP)
-                | (1 << BIT_NEG_V)
-                | (1 << BIT_MISALIGNED)
-                | (1 << BIT_MISSING_FILL)
-            ],
-            dtype=np.int32,
-        )
-    )
-
-
-_self_cov()
