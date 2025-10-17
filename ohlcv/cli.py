@@ -241,12 +241,8 @@ def cmd_quality_validate(args: argparse.Namespace) -> None:
         f"issues_csv={args.issues}; issues_parquet={args.issues_parquet}"
     )
 
-    cfg = QualityConfig(
-        missing_fill_threshold=args.miss_fill_threshold,
-        spike_window=args.spike_window,
-        spike_k=args.spike_k,
-        flat_streak_threshold=args.flat_streak,
-    )
+    # Только поддержанные параметры конструктора QualityConfig
+    cfg = QualityConfig(missing_fill_threshold=args.miss_fill_threshold)
 
     summary_rows: List[Dict[str, Any]] = []
     all_issues: List[pd.DataFrame] = []
@@ -473,6 +469,7 @@ def main() -> None:
         default=0.0001,
         help="Порог заполнения пропусков для 1m",
     )
+    # Доп. флаги CLI оставлены для совместимости, но не используются конструктором QualityConfig
     q.add_argument("--spike-window", type=int, default=200, help="Окно MAD-детектора всплесков")
     q.add_argument("--spike-k", type=float, default=12.0, help="Порог MAD-критерия")
     q.add_argument("--flat-streak", type=int, default=300, help="Длина серии нулевого объёма")

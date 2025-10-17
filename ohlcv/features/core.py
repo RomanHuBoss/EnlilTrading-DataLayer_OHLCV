@@ -1,7 +1,7 @@
 # ohlcv/features/core.py
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
@@ -10,194 +10,149 @@ from .schema import normalize_and_validate
 
 EPS = 1e-12
 
-DEFAULTS = {
+# Параметры по умолчанию для набора фич
+DEFAULTS: Dict[str, Any] = {
     "rv_windows": [20, 60],
     "donch_window": 20,
     "z_windows": [20, 60],
-    "vwap_roll_window": 96,
-    "rsi_period": 14,
-    "adx_period": 14,
-    "ema_windows": [20],
-    "mom_windows": [20],
+    "ema_windows": [5, 12, 26, 60],
+    "sma_windows": [5, 20, 60],
+    "atr_window": 14,
+    "adx_window": 14,
+    "strict": False,
 }
 
 
-def _logret(close: pd.Series) -> pd.Series:
-    return np.log(close / close.shift(1)).replace([np.inf, -np.inf], np.nan)
+# ------------------------- базовые индикаторы -------------------------
 
 
-def realized_vol(logret: pd.Series, n: int) -> pd.Series:
-    return logret.rolling(n, min_periods=n).std(ddof=1)
+def sma(x: pd.Series, n: int) -> pd.Series:
+    return x.rolling(n, min_periods=1).mean()
 
 
-def ema(series: pd.Series, n: int) -> pd.Series:
-    return series.ewm(alpha=1.0 / float(n), adjust=False).mean()
+def ema(x: pd.Series, n: int) -> pd.Series:
+    alpha = 2.0 / (n + 1.0)
+    return x.ewm(alpha=alpha, adjust=False).mean()
 
 
-def rsi_wilder(close: pd.Series, n: int) -> pd.Series:
-    delta = close.diff()
-    up = delta.clip(lower=0.0)
-    down = -delta.clip(upper=0.0)
-    avg_gain = ema(up, n)
-    avg_loss = ema(down, n)
-    rs = avg_gain / (avg_loss + EPS)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi
+def rolling_std(x: pd.Series, n: int) -> pd.Series:
+    return x.rolling(n, min_periods=1).std(ddof=0)
 
 
-def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(
-        axis=1
-    )
-    return tr
+def true_range(high: pd.Series, low: pd.Series, close_prev: pd.Series) -> pd.Series:
+    prev_close = close_prev.shift(1)
+    a = (high - low).abs()
+    b = (high - prev_close).abs()
+    c = (low - prev_close).abs()
+    return pd.concat([a, b, c], axis=1).max(axis=1).fillna(0.0)
 
 
 def atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, n: int) -> pd.Series:
     tr = true_range(high, low, close)
-    return ema(tr, n)
+    return tr.ewm(alpha=1.0 / float(n), adjust=False).mean()
 
 
 def di_adx(
     high: pd.Series, low: pd.Series, close: pd.Series, n: int
 ) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = ((up_move > down_move) & (up_move > 0)).astype(float) * up_move.clip(lower=0.0)
-    minus_dm = ((down_move > up_move) & (down_move > 0)).astype(float) * down_move.clip(lower=0.0)
-    atr = atr_wilder(high, low, close, n)
-    pdi = 100.0 * ema(plus_dm, n) / (atr + EPS)
-    mdi = 100.0 * ema(minus_dm, n) / (atr + EPS)
-    dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi + EPS)
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = ((up > down) & (up > 0)).astype(float) * up.clip(lower=0.0)
+    minus_dm = ((down > up) & (down > 0)).astype(float) * down.clip(lower=0.0)
+    atr = atr_wilder(high, low, close, n).replace(0.0, np.nan)
+    pdi = 100.0 * ema(plus_dm, n) / atr
+    mdi = 100.0 * ema(minus_dm, n) / atr
+    dx = (100.0 * (pdi - mdi).abs() / (pdi + mdi + EPS)).fillna(0.0)
     adx = ema(dx, n)
-    return pdi, mdi, adx
-
-
-def donchian(high: pd.Series, low: pd.Series, n: int) -> Tuple[pd.Series, pd.Series]:
-    hh = high.rolling(n, min_periods=n).max()
-    ll = low.rolling(n, min_periods=n).min()
-    return hh, ll
+    return pdi.fillna(0.0), mdi.fillna(0.0), adx.fillna(0.0)
 
 
 def zscore(x: pd.Series, n: int) -> pd.Series:
-    m = x.rolling(n, min_periods=n).mean()
-    s = x.rolling(n, min_periods=n).std(ddof=1)
-    return (x - m) / (s + EPS)
+    mu = sma(x, n)
+    sd = rolling_std(x, n)
+    return (x - mu) / (sd.replace(0.0, np.nan))
 
 
-def vwap_rolling(df: pd.DataFrame, n: int) -> pd.Series:
-    tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    pv = tp * df["volume"]
-    s_pv = pv.rolling(n, min_periods=n).sum()
-    s_v = df["volume"].rolling(n, min_periods=n).sum()
-    return s_pv / (s_v + EPS)
+def donchian(high: pd.Series, low: pd.Series, n: int) -> Tuple[pd.Series, pd.Series]:
+    hh = high.rolling(n, min_periods=1).max()
+    ll = low.rolling(n, min_periods=1).min()
+    return hh, ll
 
 
-def vwap_session(df: pd.DataFrame) -> pd.Series:
-    ts = pd.to_datetime(df["start_time_iso"], utc=True)
-    day_key = ts.dt.strftime("%Y-%m-%d")
-    tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    pv = tp * df["volume"]
-    s_pv = pv.groupby(day_key).cumsum()
-    s_v = df["volume"].groupby(day_key).cumsum()
-    return s_pv / (s_v + EPS)
+def realized_variance(close: pd.Series, n: int) -> pd.Series:
+    r = np.log(close.replace(0.0, np.nan)).diff().fillna(0.0)
+    return r.pow(2).rolling(n, min_periods=1).sum()
 
 
-def obv(close: pd.Series, vol: pd.Series) -> pd.Series:
-    sign = (close.diff()).apply(lambda x: 1.0 if x > 0 else (-1.0 if x < 0 else 0.0))
-    return (sign * vol).cumsum()
+# ------------------------- основной билдер фич -------------------------
+
+
+def _ensure_columns(df: pd.DataFrame, cols: Iterable[str]) -> None:
+    for c in cols:
+        if c not in df.columns:
+            df[c] = np.nan
 
 
 def compute_features(
-    df: pd.DataFrame, symbol: str, tf: str, params: Dict[str, Any] | None = None
+    df: pd.DataFrame,
+    symbol: str | None = None,
+    tf: str | None = None,
+    params: Dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    params = {**DEFAULTS, **(params or {})}
-    strict = bool(params.get("strict", False))
+    cfg = {**DEFAULTS, **(params or {})}
 
-    # Нормализация входа и проверка схемы
-    df = normalize_and_validate(df, strict=strict)
+    # Нормализация входной схемы и строгая проверка при необходимости
+    norm = normalize_and_validate(df.copy(), strict=bool(cfg.get("strict", False)))
 
-    out = df.copy()
-    close = out["close"]
-    high = out["high"]
-    low = out["low"]
-    open_ = out["open"]
-    vol = out["volume"]
+    # Базовые серии
+    high = pd.to_numeric(norm["high"], errors="coerce").astype(float)
+    low = pd.to_numeric(norm["low"], errors="coerce").astype(float)
+    close = pd.to_numeric(norm["close"], errors="coerce").astype(float)
+    vol = pd.to_numeric(norm["volume"], errors="coerce").astype(float)
 
-    logret = _logret(close)
+    out = pd.DataFrame(index=norm.index)
 
-    # Доходности/волатильность
-    out["f_ret1"] = close.pct_change()
-    out["f_logret1"] = logret
-    for n in params["rv_windows"]:
-        out[f"f_rv_{n}"] = realized_vol(logret, n)
-    out["f_range_pct"] = (high - low) / (close + EPS)
-    out["f_body_pct"] = (close - open_).abs() / (close + EPS)
-    out["f_wick_upper_pct"] = (high - np.maximum(close, open_)) / (close + EPS)
-    out["f_wick_lower_pct"] = (np.minimum(close, open_) - low) / (close + EPS)
-
-    # Тренд/моментум
-    for n in params["ema_windows"]:
-        out[f"f_ema_{n}"] = ema(close, n)
-        out[f"f_ema_slope_{n}"] = out[f"f_ema_{n}"].diff()
-    for n in params["mom_windows"]:
-        out[f"f_mom_{n}"] = close - close.shift(n)
-    n_rsi = int(params["rsi_period"])
-    out[f"f_rsi{n_rsi}"] = rsi_wilder(close, n_rsi)
-    n_adx = int(params["adx_period"])
-    pdi, mdi, adx = di_adx(high, low, close, n_adx)
-    out[f"f_pdi{n_adx}"] = pdi
-    out[f"f_mdi{n_adx}"] = mdi
-    out[f"f_adx{n_adx}"] = adx
-    n_atr = int(params.get("atr_period", 14))
+    # True range и ATR
     out["f_tr"] = true_range(high, low, close)
+    n_atr = int(cfg["atr_window"])
     out[f"f_atr_{n_atr}"] = atr_wilder(high, low, close, n_atr)
-    out[f"f_atr_pct_{n_atr}"] = out[f"f_atr_{n_atr}"] / (close + EPS)
 
-    # Donchian
-    n_d = int(params["donch_window"])
-    hi, lo = donchian(high, low, n_d)
-    out[f"f_donch_h_{n_d}"] = hi
-    out[f"f_donch_l_{n_d}"] = lo
-    prev_close = close.shift(1)
-    brk = np.where(
-        (close > hi.shift(1)) & (prev_close <= hi.shift(1)),
-        1,
-        np.where((close < lo.shift(1)) & (prev_close >= lo.shift(1)), -1, 0),
-    )
-    out[f"f_donch_break_dir_{n_d}"] = brk
-    out[f"f_donch_width_pct_{n_d}"] = (hi - lo) / (close + EPS)
+    # DI/ADX
+    n_adx = int(cfg["adx_window"])
+    pdi, mdi, adx = di_adx(high, low, close, n_adx)
+    out[f"f_pdi_{n_adx}"] = pdi
+    out[f"f_mdi_{n_adx}"] = mdi
+    out[f"f_adx_{n_adx}"] = adx
 
-    # Z‑scores
-    out["f_range"] = high - low
-    for n in params["z_windows"]:
-        out[f"f_close_z_{n}"] = zscore(close, n)
-        out[f"f_range_z_{n}"] = zscore(out["f_range"], n)
-        out[f"f_vol_z_{n}"] = zscore(vol, n)
+    # EMA/SMA
+    for n in cfg["ema_windows"]:
+        out[f"f_ema_close_{int(n)}"] = ema(close, int(n))
+    for n in cfg["sma_windows"]:
+        out[f"f_sma_close_{int(n)}"] = sma(close, int(n))
+        out[f"f_sma_vol_{int(n)}"] = sma(vol, int(n))
 
-    # Объёмы
-    up_mask = close > close.shift(1)
-    down_mask = close < close.shift(1)
-    for n in params.get("vol_windows", [20]):
-        upv = (vol * up_mask.astype(int)).rolling(n, min_periods=n).sum()
-        dnv = (vol * down_mask.astype(int)).rolling(n, min_periods=n).sum()
-        out[f"f_upvol_{n}"] = upv
-        out[f"f_downvol_{n}"] = dnv
-        out[f"f_vol_balance_{n}"] = (upv - dnv) / (upv + dnv + EPS)
-    out["f_obv"] = obv(close, vol)
+    # Z-score
+    for n in cfg["z_windows"]:
+        out[f"f_z_close_{int(n)}"] = zscore(close, int(n))
 
-    # VWAP
-    n_vroll = int(params["vwap_roll_window"])
-    out[f"f_vwap_roll_{n_vroll}"] = vwap_rolling(out, n_vroll)
-    out[f"f_vwap_dev_pct_{n_vroll}"] = (close - out[f"f_vwap_roll_{n_vroll}"]) / (
-        out[f"f_vwap_roll_{n_vroll}"] + EPS
-    )
-    out["f_vwap_session"] = vwap_session(out)
-    out["f_vwap_session_dev_pct"] = (close - out["f_vwap_session"]) / (out["f_vwap_session"] + EPS)
+    # Дончиан
+    n_d = int(cfg["donch_window"])
+    hh, ll = donchian(high, low, n_d)
+    out[f"f_donch_hh_{n_d}"] = hh
+    out[f"f_donch_ll_{n_d}"] = ll
+    out[f"f_donch_width_{n_d}"] = hh - ll
+
+    # Реализованная дисперсия (волатильность)
+    for n in cfg["rv_windows"]:
+        out[f"f_rv_{int(n)}"] = realized_variance(close, int(n))
+
+    # Возвраты
+    out["f_ret"] = close.pct_change().fillna(0.0)
+    out["f_logret"] = np.log(close.replace(0.0, np.nan)).diff().fillna(0.0)
 
     # Служебные поля
-    out["symbol"] = str(symbol)
-    out["tf"] = str(tf)
+    out["symbol"] = str(symbol) if symbol is not None else ""
+    out["tf"] = str(tf) if tf is not None else ""
 
     # Первая валидная строка по всем f_*
     fcols = [c for c in out.columns if c.startswith("f_")]
