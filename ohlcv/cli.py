@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Sequence
 
 import pandas as pd
 
-from .api.bybit import get_launch_time, iter_klines_1m
+from .api.bybit import get_launch_time, iter_klines_1m, KlineRow
 from .core.resample import resample_ohlcv
 from .core.validate import ensure_missing_threshold, fill_1m_gaps, validate_1m_index
 from .io.parquet_store import parquet_path, write_idempotent
@@ -26,7 +26,7 @@ def _data_root(arg: str | None) -> Path:
     return base.expanduser().resolve()
 
 
-def _df_from_rows(rows: Sequence[Dict[str, Any]]) -> pd.DataFrame:
+def _df_from_rows(rows: Sequence[KlineRow]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(
@@ -60,9 +60,7 @@ def _hb_printer(sym: str, since: datetime, until: datetime) -> Callable[[int, in
     state: Dict[str, int | None] = {"last_ms": None}
     total_ms = int((until - since).total_seconds() * 1000) or 1
 
-    def _cb(
-        cursor_ms: int, end_ms: int
-    ) -> None:  # noqa: ARG001 — сигнатура совместима с вызывающим кодом
+    def _cb(cursor_ms: int, end_ms: int) -> None:  # noqa: ARG001
         if state["last_ms"] is None or (cursor_ms - int(state["last_ms"])) >= 6 * 60 * 60 * 1000:
             dt = datetime.fromtimestamp(cursor_ms / 1000, tz=timezone.utc)
             pct = (cursor_ms - int(since.timestamp() * 1000)) / total_ms * 100.0
@@ -122,7 +120,7 @@ def cmd_backfill(args: argparse.Namespace) -> None:
             f"[{sym}] backfill 1m {eff_since.isoformat()} → {until.isoformat()}  total≈{total} bars"
         )
 
-        acc: List[Dict[str, Any]] = []
+        acc: List[KlineRow] = []
         heartbeat = _hb_printer(sym, eff_since, until)
         for chunk in iter_klines_1m(
             sym,
@@ -179,7 +177,7 @@ def cmd_update(args: argparse.Namespace) -> None:
 
         _print(f"[{sym}] update 1m from {start.isoformat()} to {end.isoformat()}")
         heartbeat = _hb_printer(sym, start, end)
-        rows_acc: List[Dict[str, Any]] = []
+        rows_acc: List[KlineRow] = []
         for chunk in iter_klines_1m(sym, start, end, category=args.category, on_advance=heartbeat):
             rows_acc.extend(chunk)
 
@@ -226,9 +224,9 @@ def cmd_quality_validate(args: argparse.Namespace) -> None:
 
     cfg = QualityConfig(
         missing_fill_threshold=args.miss_fill_threshold,
-        spike_window=args.spike_window,  # type: ignore[call-arg]
-        spike_k=args.spike_k,  # type: ignore[call-arg]
-        flat_streak_threshold=args.flat_streak,  # type: ignore[call-arg]
+        spike_window=args.spike_window,
+        spike_k=args.spike_k,
+        flat_streak_threshold=args.flat_streak,
     )
 
     summary_rows: List[Dict[str, Any]] = []
@@ -437,7 +435,7 @@ def main() -> None:
     rep.set_defaults(func=cmd_report_missing)
 
     args = p.parse_args()
-    func: Callable[[argparse.Namespace], None] = args.func  # type: ignore[attr-defined]
+    func: Callable[[argparse.Namespace], None] = args.func
     func(args)
 
 

@@ -31,7 +31,7 @@ def _load_params(path: Optional[Path]) -> Dict[str, Any]:
     if not path:
         return dict(DEFAULTS)
     try:
-        import yaml  # type: ignore
+        import yaml
     except Exception as e:  # pragma: no cover
         raise RuntimeError("Для чтения YAML-конфига требуется пакет PyYAML") from e
     with open(path, "r", encoding="utf-8") as f:

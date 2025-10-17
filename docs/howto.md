@@ -80,11 +80,7 @@ pytest -q
 ## 4) Исторический backfill 1m (spot)
 
 ```bash
-python -m ohlcv.cli backfill \
-  --symbols BTCUSDT,ETHUSDT \
-  --since 2024-01-01 \
-  --category spot \
-  --data-root ./data
+python -m ohlcv.cli backfill --symbols BTCUSDT,ETHUSDT --since 2024-01-01 --category spot --data-root ./data
 ```
 
 Поведение: прогресс, heartbeat в «пустых» окнах, календаризация 1m (`is_gap`), валидация индекса, запись Parquet (ZSTD, метаданные, идемпотентная догрузка).
