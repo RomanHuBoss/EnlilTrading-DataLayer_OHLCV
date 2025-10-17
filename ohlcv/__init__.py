@@ -1,23 +1,19 @@
-# Пакет и публичные экспортируемые символы.
+from __future__ import annotations
 
-# Пакет и публичные экспортируемые символы.
-
-from .version import __version__
-
-# Удобные реэкспорты C2 (необязательны, но упрощают импорт в скриптах/тетрадках):
-#   from ohlcv import quality_validate, QualityConfig, DQ_BITS
+# Версия пакета — максимально надёжное получение.
 try:
-    from .quality import DQ_BITS, QualityConfig
-    from .quality import validate as quality_validate  # noqa: F401
+    # Локальный модуль, если присутствует (генерируемый при сборке).
+    from .version import __version__  # type: ignore[attr-defined]
 except Exception:
-    # На случай частичных установок без подпакета quality.
-    quality_validate = None  # type: ignore
-    QualityConfig = None  # type: ignore
-    DQ_BITS = None  # type: ignore
+    try:
+        # Установленное имя дистрибутива из pyproject.toml
+        from importlib.metadata import PackageNotFoundError, version
 
-__all__ = [
-    "__version__",
-    "quality_validate",
-    "QualityConfig",
-    "DQ_BITS",
-]
+        try:
+            __version__ = version("ohlcv-pipeline")  # type: ignore[assignment]
+        except PackageNotFoundError:
+            __version__ = "0.0.0"  # type: ignore[assignment]
+    except Exception:  # крайний fallback
+        __version__ = "0.0.0"  # type: ignore[assignment]
+
+__all__ = ["__version__"]
