@@ -7,28 +7,15 @@ C3 — расчёт детерминированных признаков пов
 
 ## Состав компонентов
 
-- **C1 · DataLayer.OHLCV** — импорт, нормализация, ресемплинг, идемпотентная запись Parquet, отчёты пропусков.
-- **C2 · DataQuality** — валидация, санитайз, сводные отчёты качества, флаги DQ на данных.
-- **C3 · Features.Core** — вычисление признаков из валидированных OHLCV; без внешних TA-зависимостей; pandas-only.
+* **C1 · DataLayer.OHLCV** — импорт, нормализация, ресемплинг, идемпотентная запись Parquet, отчёты пропусков.
+* **C2 · DataQuality** — валидация, санитайз, сводные отчёты качества, флаги DQ на данных.
+* **C3 · Features.Core** — вычисление признаков из валидированных OHLCV; без внешних TA-зависимостей; pandas-only.
 
 ## Требования
 
-- Python 3.11+
-- pandas >= 2.2 (требуется для C3; совместимо с C1/C2)
-- Остальные зависимости — см. `requirements.txt`
-
-## CLI (сводка)
-
-## C1/C2
-
-## Возможности
-
-* Загрузка 1m OHLCV с Bybit v5 (spot/linear/inverse), устойчивые ретраи и лимиты.
-* Идемпотентная запись Parquet per (symbol, tf) c метаданными и детерминированным `data_hash`.
-* Ресемплинг из 1m → 5m/15m/1h (`label=right`, `closed=left`).
-* Репарация минутных пропусков (`is_gap`), базовая валидация индекса/календаря.
-* DataQuality: `validate(df) -> (df_clean, issues)`; флаги `dq_flags`, заметки `dq_notes`.
-* CLI: backfill, update, resample, quality-validate, report-missing.
+* Python 3.11+
+* pandas ≥ 2.2
+* Остальные зависимости — см. `pyproject.toml`
 
 ## Установка
 
@@ -40,7 +27,9 @@ pip install -e .[dev]
 
 Переменные окружения (опционально): `BYBIT_API_KEY`, `BYBIT_API_SECRET`. Каталог данных: `C1_DATA_ROOT` или `./data` по умолчанию.
 
-## CLI
+## CLI (сводка)
+
+### C1/C2
 
 ```bash
 # История 1m (UTC)
@@ -61,49 +50,88 @@ python -m ohlcv.cli quality-validate --symbols BTCUSDT,ETHUSDT --tf 1m --write \
   --quality-summary-csv ./reports/quality_summary.csv --quality-summary-json ./reports/quality_summary.json --truncate
 ```
 
-## Формат данных
+### Формат данных
 
 Parquet per `(symbol, tf)`; обязательные колонки: `ts, o, h, l, c, v`; опционально: `t, is_gap, dq_flags, dq_notes`.
-Метаданные в `c1.meta` (JSON): `symbol, tf, source, generated_at, build_signature, data_hash, schema`.
+Метаданные в `c1.meta` (JSON): `symbol, tf, generated_at, data_hash, schema`.
 
-## Артефакты DoD/NFR
+---
+
+## C3 · Features.Core
+
+```bash
+# Пример: формирование признаков на минутных барах
+python -m ohlcv.features.cli build \
+  --input ./data/BTCUSDT/1m.parquet \
+  --symbol BTCUSDT \
+  --tf 1m \
+  --config configs/features.example.yaml \
+  --output out/BTCUSDT_1m_features.parquet
+```
+
+### Важное про `--tf` и частоту входа
+
+* Частота признаков определяется частотой **входного** файла.
+* Параметр `--tf` в `features.cli` — это **метка** в выходе (`tf`), а не механизм ресемплинга.
+* Для часовых признаков подай часовые бары. Ресемплинг выполняется **в C1** (`python -m ohlcv.cli resample`), а не в `features.cli`.
+
+Корректные последовательности:
+
+```bash
+# 1) Минутные фичи из минутного входа
+python -m ohlcv.features.cli build --input data/SYM/1m.parquet --symbol SYM --tf 1m --output out/SYM_1m_features.parquet
+
+# 2) Часовые фичи: сначала ресемплинг 1m→1h, затем расчёт признаков на 1h
+python -m ohlcv.cli resample --symbols SYM --from-tf 1m --to-tf 1h --data-root ./data
+python -m ohlcv.features.cli build --input data/SYM/1h.parquet --symbol SYM --tf 1h --output out/SYM_1h_features.parquet
+
+# 3) Если указать --tf 1h на минутном входе — частота признаков останется минутной; изменится только метка tf в выходе
+python -m ohlcv.features.cli build --input data/SYM/1m.parquet --symbol SYM --tf 1h --output out/SYM_mislabel.parquet
+# Некорректное использование; не полагайся на такую сборку.
+```
+
+### Вход/выход
+
+* Вход: CSV/Parquet из C2 с колонками `timestamp_ms,start_time_iso,open,high,low,close,volume,(turnover?)`; допускается внутренняя схема `o,h,l,c,v,(t?)` (автопереименование).
+* Выход: исходные поля + признаки `f_*`, а также `symbol`, `tf`, `f_valid_from`, `f_build_version`.
+
+### Набор признаков по умолчанию
+
+* Доходности/вола: `f_ret`, `f_logret`, `f_rv_{20,60}`
+* Свечные: `f_tr`, `f_atr_14`, ширина Дончиана
+* Тренд/моментум: EMA/SMA, `±DI/ADX`
+* Z-score: `f_z_close_{20,60}`
+* Объёмы: скользящие средние объёма
+* `f_valid_from = max(всех окон)` — позиция первой полной строки без NaN по всем `f_*`
+
+---
+
+## Артефакты
 
 * Parquet: `data/{symbol}/{1m,5m,15m,1h}.parquet`
 * Журнал DQ: `reports/issues.{csv,parquet}`
 * Сводка качества: `reports/quality_summary.{csv,json}`
 * Отчёты пропусков: `reports/missing_{1m,5m,15m,1h}.csv`
-* Логи интеграции: `docs/releases/<DATE>/integration.log`
-* Проверка задержки: `tools/check_latency.py`
 
-```bash
-features-core build   --input path/to/ohlcv.csv   --symbol BTCUSDT   --tf 5m   --config configs/features.example.yaml   --output out/BTCUSDT_5m_features.parquet
+## Структура репозитория
+
 ```
-
-## C3 · Features.Core
-
-### Вход/выход
-- Вход: CSV/Parquet из C2 с колонками `timestamp_ms,start_time_iso,open,high,low,close,volume,(turnover?)`; допускается внутренняя схема `o,h,l,c,v,(t?)` (автопереименование).
-- Выход: исходные поля + признаки `f_*`, а также `symbol`, `tf`, `f_valid_from`, `f_build_version`.
-
-### Набор признаков по умолчанию
-- Доходности/вола: `f_ret1`, `f_logret1`, `f_rv_20`, `f_rv_60`
-- Свечные: `f_range_pct`, `f_body_pct`, `f_wick_upper_pct`, `f_wick_lower_pct`, `f_tr`, `f_atr_14`, `f_atr_pct_14`
-- Тренд/моментум: `f_ema_20`, `f_ema_slope_20`, `f_mom_20`, `f_rsi14`, `f_pdi14`, `f_mdi14`, `f_adx14`
-- Donchian 20: `f_donch_h_20`, `f_donch_l_20`, `f_donch_break_dir_20`, `f_donch_width_pct_20`
-- Z-score: `f_close_z_20`, `f_close_z_60`, `f_range_z_20`, `f_range_z_60`, `f_vol_z_20`, `f_vol_z_60`
-- Объёмы: `f_upvol_20`, `f_downvol_20`, `f_vol_balance_20`, `f_obv`
-- VWAP: `f_vwap_roll_96`, `f_vwap_dev_pct_96`, `f_vwap_session`, `f_vwap_session_dev_pct`
-
-### Версионирование сборок признаков
-`f_build_version = C3.Features.Core@0.1.0+<hash12>`; хэш учитывает git-ревизию и параметры.
-
----
+ohlcv/
+  cli.py                # C1/C2: backfill/update/resample/report/quality-validate
+  core/                 # базовые операции над рядами (ресемплинг/валидации)
+  io/                   # parquet_store и I/O-утилиты
+  quality/              # валидатор данных (C2)
+  features/             # вычисление признаков и CLI (C3)
+configs/
+  features.example.yaml # пример конфигурации C3
+tests/                  # юнит- и интеграционные тесты
+data/                   # корень данных по умолчанию (локально)
+reports/                # отчёты (issues, quality_summary, missing)
+```
 
 ## CI
 
-* Покрытие для `ohlcv/quality`: 100% (`pytest-cov`).
-* Гейт DQ: падение при наличии дефектов на данных репозитория.
-  Workflow: `.github/workflows/ci.yml`.
+`pytest -q --maxfail=1 --disable-warnings --cov=ohlcv --cov-report=term-missing`
 
 ## Спецификации
 
