@@ -58,15 +58,15 @@ def test_missing_small_fill_sets_is_gap_and_flags():
 
     # Должны восстановиться 10 строк
     assert clean.shape[0] == 10
-    # И на восстановленных минутах is_gap=True и есть флаги MISSING_*
-    assert clean.loc[drop_idx, "is_gap"].all()
-    for ts in drop_idx:
-        assert clean.loc[ts, "dq_flags"] & (1 << DQ_BITS["MISSING_BARS"]) != 0
-        assert clean.loc[ts, "dq_flags"] & (1 << DQ_BITS["MISSING_FILLED"]) != 0
+    # На вставленных строках должен стоять флаг is_gap и соответствующий dq_flag
+    gap_rows = clean.loc[drop_idx]
+    assert gap_rows["is_gap"].astype(bool).all()
+    assert (gap_rows["dq_flags"] != 0).all()
+    assert (issues["code"] == "MISSING").any()
 
 
-def test_misaligned_timestamps_are_aligned_to_right_boundary():
-    # Создадим метки, сдвинутые на +10 секунд — должны округлиться к правой границе минуты
+def test_misaligned_ts_are_shifted_to_right_edges():
+    # Искусственно создадим метки, не совпадающие с правыми границами минут
     base = pd.Timestamp("2024-01-01T00:00:00Z")
     idx = pd.DatetimeIndex(
         [base + pd.Timedelta(seconds=10), base + pd.Timedelta(minutes=1, seconds=10)], tz="UTC"

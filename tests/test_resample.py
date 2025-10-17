@@ -20,23 +20,27 @@ def _mk_df(n: int, start: str = "2024-01-01T00:00:00Z") -> pd.DataFrame:
     return pd.DataFrame({"o": o, "h": h, "l": low, "c": c, "v": v}, index=idx)
 
 
-def test_validate_ok():
-    df = _mk_df(5)
-    validate_1m_index(df)  # не должно бросить исключение
+def test_validate_1m_index_ok() -> None:
+    df = _mk_df(10)
+    # не бросает исключение на корректном минутном индексе
+    validate_1m_index(df)
 
 
-def test_resample_5m_shapes():
+def test_resample_basic_to_5m() -> None:
     df = _mk_df(10)
     out = resample_ohlcv(df, "5m")
-    # 10 минут с окном 5m и политикой label="right", closed="left" → 2 бара
+    # 10 минут при окне 5m и политике label="right", closed="left" → 2 бара
     assert out.shape[0] == 2
-    # Проверка агрегатов по колонкам
+    # Проверка набора колонок
     assert set(out.columns) == {"o", "h", "l", "c", "v"}
+    # Базовая монотонность и tz-aware
+    assert isinstance(out.index, pd.DatetimeIndex) and out.index.tz is not None
+    assert out.index.is_monotonic_increasing
 
 
-def test_missing_threshold():
+def test_missing_threshold() -> None:
     df = _mk_df(100)
-    # удалим 10 последовательных минут (10%)
+    # удалим 10 последовательных минут (≈10%)
     drop_idx = df.index[10:20]
     df = df.drop(drop_idx)
     r = missing_rate(df)

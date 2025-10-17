@@ -1,4 +1,4 @@
-# ohlcv/cli.py — C1/C2 CLI: backfill/update/resample/report + quality-validate
+"""CLI C1/C2: backfill/update/resample/report + quality-validate."""
 from __future__ import annotations
 
 import argparse
@@ -14,9 +14,9 @@ from .api.bybit import get_launch_time, iter_klines_1m, KlineRow
 from .core.resample import resample_ohlcv
 from .core.validate import ensure_missing_threshold, fill_1m_gaps, validate_1m_index
 from .io.parquet_store import parquet_path, write_idempotent
-from .quality.validator import QualityConfig
-from .quality.validator import validate as dq_validate
+from .quality.validator import QualityConfig, validate as dq_validate
 from .utils.timeframes import tf_minutes
+
 
 # -------------------- общие утилиты --------------------
 
@@ -43,7 +43,11 @@ def _print(msg: str) -> None:
 
 
 def _print_progress(
-    sym: str, fetched: int, total: int, last_ts: datetime, started_at: datetime
+    sym: str,
+    fetched: int,
+    total: int,
+    last_ts: datetime,
+    started_at: datetime,
 ) -> None:
     pct = (fetched / total * 100.0) if total > 0 else 0.0
     elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
@@ -51,7 +55,8 @@ def _print_progress(
     eta_sec = max(0.0, (total - fetched) / speed) if speed > 0 else 0.0
     eta_min, eta_rem = int(eta_sec // 60), int(eta_sec % 60)
     _print(
-        f"[{sym}] {fetched}/{total} ({pct:5.1f}%)  up to {last_ts.strftime('%Y-%m-%d %H:%M')}Z  "
+        f"[{sym}] {fetched}/{total} ({pct:5.1f}%)  up to "
+        f"{last_ts.strftime('%Y-%m-%d %H:%M')}Z  "
         f"speed {speed:5.1f} bars/s  ETA {eta_min:02d}:{eta_rem:02d}"
     )
 
@@ -71,9 +76,14 @@ def _hb_printer(sym: str, since: datetime, until: datetime) -> Callable[[int, in
 
 
 def _align_since_with_launch(
-    sym: str, eff_since: datetime, category: str, spot_align_futures: bool
+    sym: str,
+    eff_since: datetime,
+    category: str,
+    spot_align_futures: bool,
 ) -> datetime:
-    """Кламп начала окна к launchTime категории; для spot опционально к мин(launchTime linear,inverse)."""
+    """Кламп начала окна к launchTime категории.
+    Для spot — опционально к min(launchTime linear, inverse).
+    """
     lt = get_launch_time(sym, category=category)
     if lt and lt > eff_since:
         eff_since = lt
@@ -94,9 +104,7 @@ def cmd_backfill(args: argparse.Namespace) -> None:
     symbols = args.symbols.split(",")
     since = datetime.fromisoformat(args.since)
     since = (
-        since.replace(tzinfo=timezone.utc)
-        if since.tzinfo is None
-        else since.astimezone(timezone.utc)
+        since.replace(tzinfo=timezone.utc) if since.tzinfo is None else since.astimezone(timezone.utc)
     )
     until = (
         datetime.fromisoformat(args.until).astimezone(timezone.utc)
@@ -107,7 +115,8 @@ def cmd_backfill(args: argparse.Namespace) -> None:
 
     data_root = _data_root(getattr(args, "data_root", None))
     _print(
-        f"[cfg] data_root={str(data_root)}; category={args.category}; spot_align_futures={args.spot_align_futures}"
+        f"[cfg] data_root={str(data_root)}; category={args.category}; "
+        f"spot_align_futures={args.spot_align_futures}"
     )
 
     for sym in symbols:
@@ -117,7 +126,8 @@ def cmd_backfill(args: argparse.Namespace) -> None:
         fetched = 0
         started_at = datetime.now(timezone.utc)
         _print(
-            f"[{sym}] backfill 1m {eff_since.isoformat()} → {until.isoformat()}  total≈{total} bars"
+            f"[{sym}] backfill 1m {eff_since.isoformat()} → {until.isoformat()}  "
+            f"total≈{total} bars"
         )
 
         acc: List[KlineRow] = []
@@ -134,7 +144,11 @@ def cmd_backfill(args: argparse.Namespace) -> None:
             acc.extend(chunk)
             fetched += len(chunk)
             _print_progress(
-                sym, fetched, total, datetime.fromisoformat(chunk[-1]["ts"]), started_at
+                sym,
+                fetched,
+                total,
+                datetime.fromisoformat(chunk[-1]["ts"]),
+                started_at,
             )
 
         _print(f"[{sym}] fetched={fetched} bars. Репарация/валидация…")
@@ -161,7 +175,8 @@ def cmd_update(args: argparse.Namespace) -> None:
 
     data_root = _data_root(getattr(args, "data_root", None))
     _print(
-        f"[cfg] data_root={str(data_root)}; category={args.category}; spot_align_futures={args.spot_align_futures}"
+        f"[cfg] data_root={str(data_root)}; category={args.category}; "
+        f"spot_align_futures={args.spot_align_futures}"
     )
 
     for sym in symbols:
@@ -219,7 +234,8 @@ def cmd_quality_validate(args: argparse.Namespace) -> None:
     symbols = args.symbols.split(",")
     tf = args.tf
     _print(
-        f"[cfg] data_root={str(data_root)}; tf={tf}; write={args.write}; issues_csv={args.issues}; issues_parquet={args.issues_parquet}"
+        f"[cfg] data_root={str(data_root)}; tf={tf}; write={args.write}; "
+        f"issues_csv={args.issues}; issues_parquet={args.issues_parquet}"
     )
 
     cfg = QualityConfig(
@@ -243,7 +259,13 @@ def cmd_quality_validate(args: argparse.Namespace) -> None:
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
         df = df.set_index("ts").sort_index()
 
-        clean, issues = dq_validate(df, tf=tf, symbol=sym, repair=not args.no_repair, config=cfg)
+        clean, issues = dq_validate(
+            df,
+            tf=tf,
+            symbol=sym,
+            repair=not args.no_repair,
+            config=cfg,
+        )
 
         if not issues.empty:
             issues = issues.assign(symbol=sym, tf=tf)
@@ -259,7 +281,13 @@ def cmd_quality_validate(args: argparse.Namespace) -> None:
         _print(f"[{sym}] summary: rows_in={total} rows_out={total_clean} issues={n_issues}")
 
         summary_rows.append(
-            {"symbol": sym, "tf": tf, "rows_in": total, "rows_out": total_clean, "issues": n_issues}
+            {
+                "symbol": sym,
+                "tf": tf,
+                "rows_in": total,
+                "rows_out": total_clean,
+                "issues": n_issues,
+            }
         )
 
     if all_issues:
@@ -349,10 +377,15 @@ def main() -> None:
     b.add_argument("--since", required=True, help="ISO дата начала (UTC)")
     b.add_argument("--until", required=False, help="ISO дата окончания (UTC)")
     b.add_argument(
-        "--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT"
+        "--data-root",
+        required=False,
+        help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT",
     )
     b.add_argument(
-        "--category", required=False, choices=["spot", "linear", "inverse"], default="spot"
+        "--category",
+        required=False,
+        choices=["spot", "linear", "inverse"],
+        default="spot",
     )
     b.add_argument(
         "--spot-align-futures",
@@ -364,10 +397,15 @@ def main() -> None:
     u = sub.add_parser("update", help="Обновление хвоста 1m до текущего времени - 1 бар")
     u.add_argument("--symbols", required=True)
     u.add_argument(
-        "--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT"
+        "--data-root",
+        required=False,
+        help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT",
     )
     u.add_argument(
-        "--category", required=False, choices=["spot", "linear", "inverse"], default="spot"
+        "--category",
+        required=False,
+        choices=["spot", "linear", "inverse"],
+        default="spot",
     )
     u.add_argument(
         "--spot-align-futures",
@@ -381,7 +419,9 @@ def main() -> None:
     r.add_argument("--from-tf", required=True, choices=["1m"])
     r.add_argument("--to-tf", required=True, choices=["5m", "15m", "1h"])
     r.add_argument(
-        "--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT"
+        "--data-root",
+        required=False,
+        help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT",
     )
     r.set_defaults(func=cmd_resample)
 
@@ -389,14 +429,20 @@ def main() -> None:
     q.add_argument("--symbols", required=True, help="CSV тикеров")
     q.add_argument("--tf", required=True, choices=["1m", "5m", "15m", "1h"])
     q.add_argument(
-        "--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT"
+        "--data-root",
+        required=False,
+        help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT",
     )
     q.add_argument("--write", action="store_true", help="Перезаписать очищенный файл Parquet")
     q.add_argument(
-        "--issues", required=False, help="Путь для CSV-журнала проблем; append по умолчанию"
+        "--issues",
+        required=False,
+        help="Путь для CSV-журнала проблем; append по умолчанию",
     )
     q.add_argument(
-        "--issues-parquet", required=False, help="Путь для Parquet-журнала проблем; перезапись"
+        "--issues-parquet",
+        required=False,
+        help="Путь для Parquet-журнала проблем; перезапись",
     )
     q.add_argument(
         "--quality-summary-csv",
@@ -409,10 +455,14 @@ def main() -> None:
         help="Путь для сводного JSON по качеству; перезапись",
     )
     q.add_argument(
-        "--truncate", action="store_true", help="Сначала очистить целевые CSV перед записью"
+        "--truncate",
+        action="store_true",
+        help="Сначала очистить целевые CSV перед записью",
     )
     q.add_argument(
-        "--no-repair", action="store_true", help="Только диагностировать, без автоправок"
+        "--no-repair",
+        action="store_true",
+        help="Только диагностировать, без автоправок",
     )
     q.add_argument(
         "--miss-fill-threshold",
@@ -430,7 +480,9 @@ def main() -> None:
     rep.add_argument("--tf", required=True, choices=["1m", "5m", "15m", "1h"])
     rep.add_argument("--out", required=True)
     rep.add_argument(
-        "--data-root", required=False, help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT"
+        "--data-root",
+        required=False,
+        help="Каталог данных; по умолчанию ./data или C1_DATA_ROOT",
     )
     rep.set_defaults(func=cmd_report_missing)
 
