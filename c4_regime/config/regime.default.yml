@@ -1,0 +1,28 @@
+ensemble:
+  vote_K: 3
+  N_conf: {"5m": 5, "15m": 5, "1h": 3}
+  N_cooldown: {"5m": 10, "15m": 8, "1h": 3}
+
+D1_adx:
+  T_adx: 22
+  T_di: 5
+
+D2_donch:
+  window: 20
+  quantile_window: 500
+  q_low: 0.15   # проценты от цены
+  q_high: 0.60
+
+D3_bocpd:
+  lambda: 200
+  sigma_L: 20
+  stream: logret   # или close_z
+  L_min: 200
+
+D4_hmm_rv:
+  n_states: 2
+  N_hmm: 180
+  calm_threshold: 0.6
+
+runtime:
+  allow_fallback_daily: true
