@@ -1,5 +1,4 @@
 """CLI C1/C2: backfill/update/resample/report + quality-validate."""
-
 from __future__ import annotations
 
 import argparse
@@ -15,9 +14,9 @@ from .api.bybit import KlineRow, get_launch_time, iter_klines_1m
 from .core.resample import resample_ohlcv
 from .core.validate import ensure_missing_threshold, fill_1m_gaps, validate_1m_index
 from .io.parquet_store import parquet_path, write_idempotent
-from .quality.validator import QualityConfig
-from .quality.validator import validate as dq_validate
+from .quality.validator import QualityConfig, validate as dq_validate
 from .utils.timeframes import tf_minutes
+
 
 # -------------------- общие утилиты --------------------
 
@@ -105,9 +104,7 @@ def cmd_backfill(args: argparse.Namespace) -> None:
     symbols = args.symbols.split(",")
     since = datetime.fromisoformat(args.since)
     since = (
-        since.replace(tzinfo=timezone.utc)
-        if since.tzinfo is None
-        else since.astimezone(timezone.utc)
+        since.replace(tzinfo=timezone.utc) if since.tzinfo is None else since.astimezone(timezone.utc)
     )
     until = (
         datetime.fromisoformat(args.until).astimezone(timezone.utc)
@@ -241,7 +238,6 @@ def cmd_quality_validate(args: argparse.Namespace) -> None:
         f"issues_csv={args.issues}; issues_parquet={args.issues_parquet}"
     )
 
-    # Только поддержанные параметры конструктора QualityConfig
     cfg = QualityConfig(missing_fill_threshold=args.miss_fill_threshold)
 
     summary_rows: List[Dict[str, Any]] = []
@@ -360,6 +356,7 @@ def cmd_report_missing(args: argparse.Namespace) -> None:
         )
 
     out_path = Path(args.out).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(out_rows).to_csv(out_path, index=False)
     _print(f"report → {out_path}")
 
@@ -469,7 +466,6 @@ def main() -> None:
         default=0.0001,
         help="Порог заполнения пропусков для 1m",
     )
-    # Доп. флаги CLI оставлены для совместимости, но не используются конструктором QualityConfig
     q.add_argument("--spike-window", type=int, default=200, help="Окно MAD-детектора всплесков")
     q.add_argument("--spike-k", type=float, default=12.0, help="Порог MAD-критерия")
     q.add_argument("--flat-streak", type=int, default=300, help="Длина серии нулевого объёма")
