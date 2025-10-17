@@ -8,6 +8,7 @@ def _get_version() -> str:
     # 1) локальная сборка может положить ohlcv/version.py с __version__
     try:
         from .version import __version__ as v  # noqa: F401
+
         return str(v)
     except Exception:
         pass
