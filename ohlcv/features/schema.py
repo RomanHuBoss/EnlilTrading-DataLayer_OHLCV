@@ -1,7 +1,9 @@
+# ohlcv/features/schema.py
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Iterable, List
 
+import numpy as np
 import pandas as pd
 
 # Каноническая схема входа для C3
@@ -13,75 +15,139 @@ EXPECTED_DTYPES: Dict[str, str] = {
     "low": "float64",
     "close": "float64",
     "volume": "float64",
-    # "turnover": "float64",  # опционально
 }
 
-REQUIRED_COLS = [
+REQUIRED_COLUMNS: List[str] = [
     "timestamp_ms",
-    "start_time_iso",
     "open",
     "high",
     "low",
     "close",
-    "volume",
 ]
 
-ALT_NAMES = {
-    "o": "open",
-    "h": "high",
-    "l": "low",
-    "c": "close",
-    "v": "volume",
-}
+OPTIONAL_COLUMNS: List[str] = [
+    "start_time_iso",
+    "volume",
+    # допускаем «сквозной» проход дополнительных колонок (например, is_gap)
+]
 
 
-class SchemaError(ValueError):
-    pass
-
-
-def normalize_schema(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
-    """Нормализация входной таблицы к канонической схеме.
-
-    Действия:
-    - Переименует альтернативные колонки в канонические.
-    - Приведёт dtypes к EXPECTED_DTYPES (опциональная 'turnover' — best-effort).
-    - При strict=True: проверит наличие всех REQUIRED и отсутствие NaN
-      в базовых колонках.
-    """
-    rename_map = {c: ALT_NAMES[c] for c in df.columns if c in ALT_NAMES}
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing and strict:
-        raise SchemaError(f"Отсутствуют обязательные колонки: {missing}")
-
-    for c, dt in EXPECTED_DTYPES.items():
-        if c not in df.columns:
-            continue
-        if c == "timestamp_ms":
-            df[c] = pd.to_numeric(df[c], errors="raise").astype("int64")
-        elif dt == "float64":
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
-        elif dt == "string":
-            df[c] = df[c].astype("string")
+def _derive_timestamp_ms_from_index(df: pd.DataFrame) -> pd.Series:
+    idx = df.index
+    if isinstance(idx, pd.DatetimeIndex):
+        # допускаем tz-naive → считаем, что это UTC
+        if idx.tz is None:
+            ts = idx.tz_localize("UTC")
         else:
-            df[c] = df[c].astype(dt)
-
-    if "turnover" in df.columns:
-        df["turnover"] = pd.to_numeric(df["turnover"], errors="coerce")
-
-    if strict:
-        base = ["open", "high", "low", "close", "volume"]
-        bad = df[base].isna().any(axis=1)
-        if bad.any():
-            n = int(bad.sum())
-            raise SchemaError(f"Найдены {n} строк(и) с NaN в базовых колонках {base}")
-
-    return df
+            ts = idx.tz_convert("UTC")
+        return (ts.view("int64") // 1_000_000).astype("int64")
+    raise KeyError("timestamp_ms отсутствует и индекс не DatetimeIndex")
 
 
-# Совместимость с вызовами features.core
+def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "timestamp_ms" not in out.columns:
+        out["timestamp_ms"] = _derive_timestamp_ms_from_index(out)
+    for c in ["open", "high", "low", "close"]:
+        if c not in out.columns:
+            raise KeyError(f"Отсутствует обязательная колонка: {c}")
+    if "volume" not in out.columns:
+        out["volume"] = 0.0
+    if "start_time_iso" not in out.columns:
+        ts = pd.to_datetime(out["timestamp_ms"], unit="ms", utc=True)
+        out["start_time_iso"] = ts.dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return out
+
+
+def _cast_to_expected(out: pd.DataFrame) -> pd.DataFrame:
+    # Приводим только известные столбцы; неизвестные не трогаем
+    for c, dt in EXPECTED_DTYPES.items():
+        if c in out.columns:
+            try:
+                out[c] = out[c].astype(dt)
+            except Exception:
+                # последняя попытка — через to_numeric для чисел
+                if dt.startswith("float") or dt.startswith("int"):
+                    out[c] = pd.to_numeric(out[c], errors="coerce").astype(dt)
+                else:
+                    out[c] = out[c].astype("string")
+    return out
+
+
+def _repair_ohlc(out: pd.DataFrame) -> None:
+    # high/low перестановка
+    swap_mask = out["high"] < out["low"]
+    if swap_mask.any():
+        h = out.loc[swap_mask, "low"].values
+        l = out.loc[swap_mask, "high"].values
+        out.loc[swap_mask, "high"] = h
+        out.loc[swap_mask, "low"] = l
+    # клип открытий/закрытий внутрь размаха
+    out["open"] = out["open"].clip(lower=out["low"], upper=out["high"]) \
+        .astype("float64")
+    out["close"] = out["close"].clip(lower=out["low"], upper=out["high"]) \
+        .astype("float64")
+
+
+def _assert_monotonic_timestamps(out: pd.DataFrame) -> None:
+    ts = out["timestamp_ms"].values
+    if not (np.all(ts[1:] >= ts[:-1])):
+        raise ValueError("timestamp_ms не монотонно неубывающий после нормализации")
+
+
 def normalize_and_validate(df: pd.DataFrame, strict: bool = False) -> pd.DataFrame:
-    """Алиас для обратной совместимости с прежним API."""
-    return normalize_schema(df, strict=strict)
+    """Нормализует входной OHLCV к канону C3 и проверяет базовые инварианты.
+
+    Поведение:
+      - обеспечивает наличие timestamp_ms/start_time_iso/volume;
+      - приводит типы к EXPECTED_DTYPES;
+      - удаляет дубликаты по timestamp_ms (keep=last) и сортирует по времени;
+      - заменяет +/-inf на NaN;
+      - strict=False: исправляет high<low и клипует open/close внутрь [low, high];
+      - strict=True: при нарушениях инвариантов и NaN в обязательных столбцах — исключение.
+    """
+
+    out = _ensure_required_columns(df)
+
+    # типы и базовая чистка
+    out = _cast_to_expected(out)
+    out = out.replace([np.inf, -np.inf], np.nan)
+
+    # удаление дубликатов и сортировка
+    out = out.drop_duplicates(subset=["timestamp_ms"], keep="last").sort_values("timestamp_ms").reset_index(drop=True)
+
+    # проверки NaN в обязательных колонках
+    req = ["timestamp_ms", "open", "high", "low", "close"]
+    nan_bad = out[req].isna().any(axis=1)
+    if nan_bad.any():
+        if strict:
+            n = int(nan_bad.sum())
+            raise ValueError(f"Обнаружены NaN/NaT в обязательных колонках: {n} строк")
+        out = out.loc[~nan_bad].reset_index(drop=True)
+
+    # инварианты OHLC
+    bad_hl = (out["high"] < out["low"]) | out["high"].isna() | out["low"].isna()
+    if bad_hl.any():
+        if strict:
+            raise ValueError("Нарушение инварианта high>=low")
+        _repair_ohlc(out)
+
+    # open/close в пределах [low, high]
+    oc_low = (out["open"] < out["low"]) | (out["close"] < out["low"]) \
+        | out["open"].isna() | out["close"].isna()
+    oc_high = (out["open"] > out["high"]) | (out["close"] > out["high"]) \
+        | out["open"].isna() | out["close"].isna()
+    if (oc_low | oc_high).any():
+        if strict:
+            raise ValueError("Нарушение инварианта open/close ∈ [low, high]")
+        _repair_ohlc(out)
+
+    # volume: отрицательные → 0, NaN → 0 при non-strict
+    if strict and out["volume"].isna().any():
+        raise ValueError("NaN в volume при strict=True")
+    out["volume"] = out["volume"].fillna(0.0)
+    out["volume"] = out["volume"].clip(lower=0.0).astype("float64")
+
+    _assert_monotonic_timestamps(out)
+
+    return out

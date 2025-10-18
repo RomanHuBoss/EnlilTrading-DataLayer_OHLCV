@@ -1,18 +1,20 @@
-# Пример параметров для C3 · Features.Core
-# Значения можно переопределять в отдельном файле и передавать через --config
+# Конфиг C3 Features — пример. Все поля опциональны, отсутствующие берут значения по умолчанию.
+rv_windows: [20, 60]          # rolling std(logret, n), ddof=1
+z_windows: [20, 96]            # окна для z-score (close/range/volume/ATR)
+ema_windows: [20, 50]          # EMA по close
+sma_windows: [20, 50]          # SMA по close
+mom_windows: [20, 50, 100]     # моментумы по close
 
-rv_windows: [20, 60]
-ema_windows: [20]
-mom_windows: [20]
-rsi_period: 14
-adx_period: 14
-atr_period: 14
+# Каналы волатильности и тренда
+atr_window: 14                 # ATR (Wilder)
+adx_window: 14                 # ADX/DI (Wilder)
+rsi_window: 14                 # RSI
 
-donch_window: 20
-z_windows: [20, 60]
+# Каналы диапазона и ликвидности
+donch_windows: [20, 55]        # Donchian HH/LL/width (+ *_pct и break_dir)
+vwap_roll_window: 96           # скользящий VWAP (кол-во баров)
+updownvol_window: 20           # окна для upvol/downvol/vol_balance
 
-vwap_roll_window: 96
-vol_windows: [20]
-
-# Строгая проверка входных данных (NaN/inf и схема). Может быть также задана флагом CLI --strict
-strict: false
+# Поведение
+strict: false                  # строгая валидация входа (NaN/инварианты → ошибка)
+build_version: null            # явная версия сборки; если null — вычисляется автоматически

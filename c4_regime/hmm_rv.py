@@ -4,6 +4,7 @@ import numpy as np
 
 try:
     from hmmlearn.hmm import GaussianHMM  # type: ignore
+
     _HMM_AVAILABLE = True
 except Exception:  # noqa: BLE001
     _HMM_AVAILABLE = False

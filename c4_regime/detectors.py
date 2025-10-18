@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from typing import Dict, Tuple
+
 import numpy as np
 import pandas as pd
 
@@ -16,7 +17,10 @@ def _require(df: pd.DataFrame, cols: set[str]) -> None:
 
 # --- D1: ADX тренд / флэт ---
 
-def d1_adx(df: pd.DataFrame, T_adx: float, T_di: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+def d1_adx(
+    df: pd.DataFrame, T_adx: float, T_di: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     _require(df, REQUIRED_COLS_D1)
     adx = df["f_adx14"].to_numpy()
     pdi = df["f_pdi14"].to_numpy()
@@ -35,6 +39,7 @@ def d1_adx(df: pd.DataFrame, T_adx: float, T_di: float) -> Tuple[np.ndarray, np.
 
 
 # --- D2: Donchian ширина / импульс ---
+
 
 def d2_donch(
     df: pd.DataFrame,
@@ -73,6 +78,7 @@ def d2_donch(
 
 # --- D4: HMM по дневной RV (через контекст или fallback) ---
 
+
 def d4_hmm_rv(
     work_df: pd.DataFrame,
     context: Dict | pd.DataFrame | None,
@@ -102,7 +108,11 @@ def d4_hmm_rv(
             # эвристика по перцентилю
             high = (pct >= 0.90).astype(np.int8)
         s_calm = (1.0 - pct).clip(0.0, 1.0)
-        return high.astype(np.int8), s_calm.astype(float), ctx.get("ctx_rv_daily", pd.Series(index=ctx.index, dtype=float)).to_numpy()
+        return (
+            high.astype(np.int8),
+            s_calm.astype(float),
+            ctx.get("ctx_rv_daily", pd.Series(index=ctx.index, dtype=float)).to_numpy(),
+        )
 
     # Резервная агрегация
     if not allow_fallback_daily:
@@ -114,17 +124,27 @@ def d4_hmm_rv(
     df = work_df[["start_time_iso", "close"]].copy()
     ts = pd.to_datetime(df["start_time_iso"], utc=True)
     # Берём последний close каждого UTC-дня
-    day_close = df.set_index(ts).resample("1D", label="right", closed="right")["close"].last().dropna()
+    day_close = (
+        df.set_index(ts).resample("1D", label="right", closed="right")["close"].last().dropna()
+    )
     logret_d = np.log(day_close / day_close.shift(1)).dropna()
     rv = logret_d.rolling(20, min_periods=20).std(ddof=1)
     # Раскладываем на рабочий индекс через asof
     rv_df = rv.to_frame("rv_daily").reset_index().rename(columns={"index": "day_end"})
     work_ts = pd.to_datetime(work_df["start_time_iso"], utc=True)
     # Присваиваем каждому бару последнюю закрытую дневную RV
-    rv_aligned = pd.merge_asof(
-        pd.DataFrame({"t": work_ts}),
-        rv_df, left_on="t", right_on="day_end", direction="backward", allow_exact_matches=False
-    )["rv_daily"].fillna(method="ffill").fillna(0.0)
+    rv_aligned = (
+        pd.merge_asof(
+            pd.DataFrame({"t": work_ts}),
+            rv_df,
+            left_on="t",
+            right_on="day_end",
+            direction="backward",
+            allow_exact_matches=False,
+        )["rv_daily"]
+        .fillna(method="ffill")
+        .fillna(0.0)
+    )
     # Перцентиль на окне 252 дней (если доступно)
     rv_series = rv_aligned.to_numpy()
     rv_s = pd.Series(rv_series)

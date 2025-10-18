@@ -13,7 +13,7 @@ try:
 except Exception:  # noqa: BLE001
     yaml = None
 
-from .core import infer_regime, DEFAULT_CFG
+from .core import DEFAULT_CFG, infer_regime
 
 
 def _load_cfg(path: Optional[str]) -> dict:

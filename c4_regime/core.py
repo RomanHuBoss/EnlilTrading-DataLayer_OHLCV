@@ -7,10 +7,9 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from .errors import ErrorCodes as E
-from .detectors import d1_adx, d2_donch, d4_hmm_rv
 from .bocpd import run_length_bocpd, sigmoid
-
+from .detectors import d1_adx, d2_donch, d4_hmm_rv
+from .errors import ErrorCodes as E
 
 # Конфиг по умолчанию (совместим с постановкой)
 DEFAULT_CFG = {
@@ -179,8 +178,12 @@ def infer_regime(
     )
 
     # --- Голосование 3-из-4 ---
-    vote_tr = d1_tr.astype(int) + d2_tr.astype(int) + d3_tr.astype(int) + (s_hmm >= calm_thr).astype(int)
-    vote_fl = d1_fl.astype(int) + d2_fl.astype(int) + d3_fl.astype(int) + (s_hmm < calm_thr).astype(int)
+    vote_tr = (
+        d1_tr.astype(int) + d2_tr.astype(int) + d3_tr.astype(int) + (s_hmm >= calm_thr).astype(int)
+    )
+    vote_fl = (
+        d1_fl.astype(int) + d2_fl.astype(int) + d3_fl.astype(int) + (s_hmm < calm_thr).astype(int)
+    )
 
     K = int(cfg["ensemble"].get("vote_K", 3))
     regime_star = np.where(vote_tr >= K, 1, np.where(vote_fl >= K, 0, 0)).astype(np.int8)
@@ -201,9 +204,9 @@ def infer_regime(
     out["regime_confidence"] = conf
     out["votes_trend"] = vote_tr
     out["votes_flat"] = vote_fl
-    out["det_used"] = (
-        ("D1" if d1_used else "") + ("|D2" if d2_used else "") + "|D3|D4"
-    ).lstrip("|")
+    out["det_used"] = (("D1" if d1_used else "") + ("|D2" if d2_used else "") + "|D3|D4").lstrip(
+        "|"
+    )
     out["chgpt"] = chg.astype(np.int8)
     out["p_bocpd_trend"] = p_tr_bocpd
     out["p_bocpd_flat"] = 1.0 - p_tr_bocpd
