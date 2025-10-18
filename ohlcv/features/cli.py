@@ -65,7 +65,9 @@ def _dump_any(df: pd.DataFrame, path: Path) -> None:
     df.to_parquet(path, index=False)
 
 
-def _merge_config(cfg_file: Optional[Path], strict: bool, build_version: Optional[str]) -> Dict[str, Any]:
+def _merge_config(
+    cfg_file: Optional[Path], strict: bool, build_version: Optional[str]
+) -> Dict[str, Any]:
     cfg: Dict[str, Any] = dict(DEFAULTS)
     if cfg_file:
         if yaml is None:
@@ -112,13 +114,19 @@ def _add_build_parser(sub: argparse._SubParsersAction[argparse.ArgumentParser]) 
         help="Построить признаки C3 из входного OHLCV",
         description="Строит минимальный набор признаков C3 по постановке. Вход — CSV/Parquet.",
     )
-    p.add_argument("input", type=str, help="Входной CSV/Parquet с колонками: timestamp_ms,start_time_iso,open,high,low,close,volume")
+    p.add_argument(
+        "input",
+        type=str,
+        help="Входной CSV/Parquet с колонками: timestamp_ms,start_time_iso,open,high,low,close,volume",
+    )
     p.add_argument("output", type=str, help="Файл для записи признаков (Parquet/CSV по расширению)")
     p.add_argument("--symbol", type=str, default="", help="Идентификатор инструмента")
     p.add_argument("--tf", type=str, default="", help="Таймфрейм входных баров, например '5m'")
     p.add_argument("--config", type=str, default=None, help="YAML-конфиг с параметрами C3")
     p.add_argument("--strict", action="store_true", help="Строгая проверка входа и NaN")
-    p.add_argument("--build-version", type=str, default=None, help="Версия сборки (перекрывает вычисленную)")
+    p.add_argument(
+        "--build-version", type=str, default=None, help="Версия сборки (перекрывает вычисленную)"
+    )
     p.set_defaults(func=build_cmd)
 
 

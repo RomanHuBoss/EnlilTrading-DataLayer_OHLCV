@@ -1,7 +1,7 @@
 # ohlcv/features/core.py
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Tuple, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,24 +13,25 @@ EPS = 1e-12
 
 # Параметры по умолчанию для набора фич — согласованы с постановкой C3 (минимальный перечень)
 DEFAULTS: Dict[str, Any] = {
-    "rv_windows": [20, 60],                 # rolling std(logret, n), ddof=1
-    "z_windows": [20, 96],                  # окна для z-score по close/range/volume/ATR
-    "ema_windows": [20, 50],                # EMA по close
-    "sma_windows": [20, 50],                # SMA по close (для контрольных проверок/зеток)
-    "mom_windows": [20, 50, 100],           # моментумы по цене закрытия
-    "donch_windows": [20, 55],              # Donchian HH/LL/width и ширина в %
-    "atr_window": 14,                       # ATR (Wilder)
-    "adx_window": 14,                       # ADX/DI (Wilder)
-    "rsi_window": 14,                       # RSI классический
-    "vwap_roll_window": 96,                 # ~2 торговые сессии при 5m
-    "updownvol_window": 20,                 # окна для upvol/downvol/баланса
-    "strict": False,                        # режим строгой проверки входа
-    "build_version": None,                  # необязательная версия сборки
+    "rv_windows": [20, 60],  # rolling std(logret, n), ddof=1
+    "z_windows": [20, 96],  # окна для z-score по close/range/volume/ATR
+    "ema_windows": [20, 50],  # EMA по close
+    "sma_windows": [20, 50],  # SMA по close (для контрольных проверок/зеток)
+    "mom_windows": [20, 50, 100],  # моментумы по цене закрытия
+    "donch_windows": [20, 55],  # Donchian HH/LL/width и ширина в %
+    "atr_window": 14,  # ATR (Wilder)
+    "adx_window": 14,  # ADX/DI (Wilder)
+    "rsi_window": 14,  # RSI классический
+    "vwap_roll_window": 96,  # ~2 торговые сессии при 5m
+    "updownvol_window": 20,  # окна для upvol/downvol/баланса
+    "strict": False,  # режим строгой проверки входа
+    "build_version": None,  # необязательная версия сборки
 }
 
 # ----------------
 # Базовые примитивы
 # ----------------
+
 
 def _safe_rolling(series: pd.Series, window: int, fn: str) -> pd.Series:
     if window <= 1:
@@ -48,22 +49,26 @@ def _safe_rolling(series: pd.Series, window: int, fn: str) -> pd.Series:
         return roll.min()
     raise ValueError(f"unsupported rolling fn: {fn}")
 
+
 def ema(x: pd.Series, n: int) -> pd.Series:
     alpha = 2.0 / (n + 1.0)
     return x.ewm(alpha=alpha, adjust=False, min_periods=n).mean()
 
+
 def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     prev_close = close.shift(1)
-    hl = (high - low)
+    hl = high - low
     hc = (high - prev_close).abs()
     lc = (low - prev_close).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     return tr.fillna(0.0)
 
+
 def atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, n: int) -> pd.Series:
     tr = true_range(high, low, close)
     # Wilder smoothing: EMA с alpha = 1/n
     return tr.ewm(alpha=1.0 / float(n), adjust=False, min_periods=n).mean()
+
 
 def di_adx(
     high: pd.Series, low: pd.Series, close: pd.Series, n: int
@@ -79,11 +84,13 @@ def di_adx(
     adx = ema(dx, n)
     return pdi.fillna(0.0), mdi.fillna(0.0), adx.fillna(0.0)
 
+
 def zscore(x: pd.Series, n: int) -> pd.Series:
     mu = _safe_rolling(x, n, "mean")
     sd = _safe_rolling(x, n, "std")
     z = (x - mu) / (sd.replace(0.0, np.nan))
     return z.replace([np.inf, -np.inf], np.nan)
+
 
 def rsi(close: pd.Series, n: int) -> pd.Series:
     delta = close.diff()
@@ -95,8 +102,10 @@ def rsi(close: pd.Series, n: int) -> pd.Series:
     out = 100.0 - (100.0 / (1.0 + rs))
     return out.fillna(0.0)
 
+
 def _typical_price(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
     return (high + low + close) / 3.0
+
 
 def vwap_roll(
     high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, n: int
@@ -108,9 +117,11 @@ def vwap_roll(
     vwap = num / den.replace(0.0, np.nan)
     return vwap
 
+
 # ----------------
 # Основные фичи
 # ----------------
+
 
 def compute_features(
     df: pd.DataFrame,
@@ -134,7 +145,9 @@ def compute_features(
 
     # Доходности
     ret = close.pct_change().fillna(0.0)
-    logret = (np.log(close.replace(0.0, np.nan)) - np.log(close.replace(0.0, np.nan)).shift(1)).fillna(0.0)
+    logret = (
+        np.log(close.replace(0.0, np.nan)) - np.log(close.replace(0.0, np.nan)).shift(1)
+    ).fillna(0.0)
 
     # Волатильность (реализованная) — несмещённая std(logret, n)
     out = pd.DataFrame(index=df.index)
@@ -162,7 +175,7 @@ def compute_features(
     for n in cfg["donch_windows"]:
         hh = _safe_rolling(high, int(n), "max")
         ll = _safe_rolling(low, int(n), "min")
-        width = (hh - ll)
+        width = hh - ll
         out[f"f_donch_hh_{n}"] = hh
         out[f"f_donch_ll_{n}"] = ll
         out[f"f_donch_width_{n}"] = width
@@ -177,9 +190,9 @@ def compute_features(
 
     # Свечные относительные метрики
     body = (close - open_).abs()
-    range_ = (high - low)
-    upper_wick = (high - np.maximum(open_, close))
-    lower_wick = (np.minimum(open_, close) - low)
+    range_ = high - low
+    upper_wick = high - np.maximum(open_, close)
+    lower_wick = np.minimum(open_, close) - low
     with np.errstate(divide="ignore", invalid="ignore"):
         out["f_range_pct"] = (range_ / close.replace(0.0, np.nan)).fillna(0.0)
         out["f_body_pct"] = (body / (range_.replace(0.0, np.nan))).fillna(0.0)
@@ -191,7 +204,9 @@ def compute_features(
         ema_n = ema(close, int(n))
         out[f"f_ema_close_{n}"] = ema_n
         # slope как относительное приращение EMA за окно n, в долях
-        out[f"f_ema_slope_{n}"] = (ema_n - ema_n.shift(int(n))) / (ema_n.shift(int(n)).replace(0.0, np.nan))
+        out[f"f_ema_slope_{n}"] = (ema_n - ema_n.shift(int(n))) / (
+            ema_n.shift(int(n)).replace(0.0, np.nan)
+        )
         out[f"f_ema_slope_{n}"] = out[f"f_ema_slope_{n}"].fillna(0.0)
 
     for n in cfg["sma_windows"]:
@@ -199,7 +214,9 @@ def compute_features(
 
     # Моментумы по цене закрытия
     for n in cfg["mom_windows"]:
-        out[f"f_mom_{n}"] = (close / close.shift(int(n)) - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        out[f"f_mom_{n}"] = (
+            (close / close.shift(int(n)) - 1.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        )
 
     # RSI
     out[f"f_rsi_{int(cfg['rsi_window'])}"] = rsi(close, int(cfg["rsi_window"]))
@@ -218,12 +235,16 @@ def compute_features(
     downvol = (volume.where(down_mask, 0.0)).rolling(w, min_periods=w).sum()
     out[f"f_upvol_{w}"] = upvol.fillna(0.0)
     out[f"f_downvol_{w}"] = downvol.fillna(0.0)
-    out[f"f_vol_balance_{w}"] = ((upvol - downvol) / (upvol + downvol).replace(0.0, np.nan)).fillna(0.0)
+    out[f"f_vol_balance_{w}"] = ((upvol - downvol) / (upvol + downvol).replace(0.0, np.nan)).fillna(
+        0.0
+    )
 
     # VWAP: скользящий и сессионный
     vrw = int(cfg["vwap_roll_window"])
     out[f"f_vwap_roll_{vrw}"] = vwap_roll(high, low, close, volume, vrw)
-    out[f"f_vwap_dev_pct_{vrw}"] = ((close - out[f"f_vwap_roll_{vrw}"]) / out[f"f_vwap_roll_{vrw}"].replace(0.0, np.nan)).fillna(0.0)
+    out[f"f_vwap_dev_pct_{vrw}"] = (
+        (close - out[f"f_vwap_roll_{vrw}"]) / out[f"f_vwap_roll_{vrw}"].replace(0.0, np.nan)
+    ).fillna(0.0)
 
     # Сессионный VWAP по календарному дню (UTC) — если есть timestamp_ms
     if "timestamp_ms" in df.columns:
@@ -236,14 +257,24 @@ def compute_features(
         vv = volume.groupby(day).cumsum()
         sess_vwap = pv / vv.replace(0.0, np.nan)
         out["f_vwap_session"] = sess_vwap
-        out["f_vwap_session_dev_pct"] = ((close - sess_vwap) / sess_vwap.replace(0.0, np.nan)).fillna(0.0)
+        out["f_vwap_session_dev_pct"] = (
+            (close - sess_vwap) / sess_vwap.replace(0.0, np.nan)
+        ).fillna(0.0)
     else:
         out["f_vwap_session"] = np.nan
         out["f_vwap_session_dev_pct"] = 0.0
 
     # Столбцы-идентификаторы и метаданные сборки
     out.insert(0, "timestamp_ms", df["timestamp_ms"].astype("int64"))
-    out.insert(1, "start_time_iso", df["start_time_iso"].astype("string") if "start_time_iso" in df.columns else pd.Series([""], index=df.index, dtype="string"))
+    out.insert(
+        1,
+        "start_time_iso",
+        (
+            df["start_time_iso"].astype("string")
+            if "start_time_iso" in df.columns
+            else pd.Series([""], index=df.index, dtype="string")
+        ),
+    )
     if symbol is not None:
         out["symbol"] = str(symbol)
     else:
@@ -268,7 +299,11 @@ def compute_features(
     if cfg.get("build_version"):
         bv = str(cfg["build_version"])
     else:
-        bv = BuildMeta(component="C3", version="0.1.0", params={k: v for k, v in cfg.items() if k != "build_version"}).build_version()
+        bv = BuildMeta(
+            component="C3",
+            version="0.1.0",
+            params={k: v for k, v in cfg.items() if k != "build_version"},
+        ).build_version()
     out["f_build_version"] = bv
 
     # Чистка бесконечностей

@@ -38,8 +38,12 @@ def _probe_git() -> Tuple[str, bool]:
     """
     try:
         # Проверка, что мы в репозитории
-        subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
         # Наличие незакоммиченных изменений
         status = subprocess.check_output(["git", "status", "--porcelain"], text=True)

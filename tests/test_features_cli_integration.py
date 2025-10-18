@@ -22,7 +22,9 @@ def _mk_df(n: int = 128, start_ts: int = 1_700_000_000_000, step_ms: int = 300_0
     return pd.DataFrame(
         {
             "timestamp_ms": ts,
-            "start_time_iso": pd.to_datetime(ts, unit="ms", utc=True).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "start_time_iso": pd.to_datetime(ts, unit="ms", utc=True).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            ),
             "open": open_,
             "high": high,
             "low": low,
@@ -49,12 +51,20 @@ def test_cli_build_csv_roundtrip(tmp_path: Path, ext: str):
     got = pd.read_csv(out)
     # минимальный набор столбцов
     must = [
-        "timestamp_ms", "symbol", "tf",
-        "f_rv_20", "f_rv_60",
-        "f_adx_14", "f_pdi_14", "f_mdi_14",
-        "f_donch_width_pct_20", "f_donch_width_pct_55",
-        "f_vwap_roll_96", "f_vwap_dev_pct_96",
-        "f_valid_from", "f_build_version",
+        "timestamp_ms",
+        "symbol",
+        "tf",
+        "f_rv_20",
+        "f_rv_60",
+        "f_adx_14",
+        "f_pdi_14",
+        "f_mdi_14",
+        "f_donch_width_pct_20",
+        "f_donch_width_pct_55",
+        "f_vwap_roll_96",
+        "f_vwap_dev_pct_96",
+        "f_valid_from",
+        "f_build_version",
     ]
     missing = [c for c in must if c not in got.columns]
     assert not missing, f"missing: {missing}"
@@ -82,10 +92,13 @@ def test_cli_with_yaml_config(tmp_path: Path):
 
     _mk_df().to_csv(inp, index=False)
 
-    cfg.write_text("""
+    cfg.write_text(
+        """
 rv_windows: [20]
 vwap_roll_window: 5
-""".strip(), encoding="utf-8")
+""".strip(),
+        encoding="utf-8",
+    )
 
     rc = cli_main(["build", str(inp), str(out), "--config", str(cfg)])
     assert rc == 0

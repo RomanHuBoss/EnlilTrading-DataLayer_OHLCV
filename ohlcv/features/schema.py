@@ -83,10 +83,8 @@ def _repair_ohlc(out: pd.DataFrame) -> None:
         out.loc[swap_mask, "high"] = h
         out.loc[swap_mask, "low"] = l
     # клип открытий/закрытий внутрь размаха
-    out["open"] = out["open"].clip(lower=out["low"], upper=out["high"]) \
-        .astype("float64")
-    out["close"] = out["close"].clip(lower=out["low"], upper=out["high"]) \
-        .astype("float64")
+    out["open"] = out["open"].clip(lower=out["low"], upper=out["high"]).astype("float64")
+    out["close"] = out["close"].clip(lower=out["low"], upper=out["high"]).astype("float64")
 
 
 def _assert_monotonic_timestamps(out: pd.DataFrame) -> None:
@@ -114,7 +112,11 @@ def normalize_and_validate(df: pd.DataFrame, strict: bool = False) -> pd.DataFra
     out = out.replace([np.inf, -np.inf], np.nan)
 
     # удаление дубликатов и сортировка
-    out = out.drop_duplicates(subset=["timestamp_ms"], keep="last").sort_values("timestamp_ms").reset_index(drop=True)
+    out = (
+        out.drop_duplicates(subset=["timestamp_ms"], keep="last")
+        .sort_values("timestamp_ms")
+        .reset_index(drop=True)
+    )
 
     # проверки NaN в обязательных колонках
     req = ["timestamp_ms", "open", "high", "low", "close"]
@@ -133,10 +135,18 @@ def normalize_and_validate(df: pd.DataFrame, strict: bool = False) -> pd.DataFra
         _repair_ohlc(out)
 
     # open/close в пределах [low, high]
-    oc_low = (out["open"] < out["low"]) | (out["close"] < out["low"]) \
-        | out["open"].isna() | out["close"].isna()
-    oc_high = (out["open"] > out["high"]) | (out["close"] > out["high"]) \
-        | out["open"].isna() | out["close"].isna()
+    oc_low = (
+        (out["open"] < out["low"])
+        | (out["close"] < out["low"])
+        | out["open"].isna()
+        | out["close"].isna()
+    )
+    oc_high = (
+        (out["open"] > out["high"])
+        | (out["close"] > out["high"])
+        | out["open"].isna()
+        | out["close"].isna()
+    )
     if (oc_low | oc_high).any():
         if strict:
             raise ValueError("Нарушение инварианта open/close ∈ [low, high]")

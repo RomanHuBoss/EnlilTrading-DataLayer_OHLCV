@@ -4,7 +4,7 @@ C3.Features.Core — публичный API пакета.
 Версия пакета — __version__.
 """
 
-from .core import compute_features, DEFAULTS
+from .core import DEFAULTS, compute_features
 from .schema import normalize_and_validate
 from .utils import BuildMeta
 

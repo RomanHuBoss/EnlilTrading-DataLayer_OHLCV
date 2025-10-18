@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from ohlcv.features import compute_features, DEFAULTS, normalize_and_validate
+from ohlcv.features import DEFAULTS, compute_features, normalize_and_validate
 
 
 def _mk_df(n: int = 120, start_ts: int = 1_700_000_000_000, step_ms: int = 300_000) -> pd.DataFrame:
@@ -20,7 +20,9 @@ def _mk_df(n: int = 120, start_ts: int = 1_700_000_000_000, step_ms: int = 300_0
     df = pd.DataFrame(
         {
             "timestamp_ms": ts,
-            "start_time_iso": pd.to_datetime(ts, unit="ms", utc=True).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "start_time_iso": pd.to_datetime(ts, unit="ms", utc=True).strftime(
+                "%Y-%m-%dT%H:%M:%S.%fZ"
+            ),
             "open": open_,
             "high": high,
             "low": low,
@@ -42,17 +44,33 @@ def test_compute_features_schema_and_basic_columns():
 
     # Ключевые признаки из постановки
     need = [
-        "f_rv_20", "f_rv_60",
-        "f_adx_14", "f_pdi_14", "f_mdi_14",
-        "f_donch_width_pct_20", "f_donch_width_pct_55",
-        "f_range_pct", "f_body_pct", "f_wick_upper_pct", "f_wick_lower_pct",
-        "f_ema_close_20", "f_ema_slope_20", "f_mom_20",
+        "f_rv_20",
+        "f_rv_60",
+        "f_adx_14",
+        "f_pdi_14",
+        "f_mdi_14",
+        "f_donch_width_pct_20",
+        "f_donch_width_pct_55",
+        "f_range_pct",
+        "f_body_pct",
+        "f_wick_upper_pct",
+        "f_wick_lower_pct",
+        "f_ema_close_20",
+        "f_ema_slope_20",
+        "f_mom_20",
         "f_rsi_14",
-        "f_close_z_20", "f_range_z_20", "f_vol_z_20",
-        "f_upvol_20", "f_downvol_20", "f_vol_balance_20",
-        "f_vwap_roll_96", "f_vwap_dev_pct_96",
-        "f_vwap_session", "f_vwap_session_dev_pct",
-        "f_valid_from", "f_build_version",
+        "f_close_z_20",
+        "f_range_z_20",
+        "f_vol_z_20",
+        "f_upvol_20",
+        "f_downvol_20",
+        "f_vol_balance_20",
+        "f_vwap_roll_96",
+        "f_vwap_dev_pct_96",
+        "f_vwap_session",
+        "f_vwap_session_dev_pct",
+        "f_valid_from",
+        "f_build_version",
     ]
     missing = [c for c in need if c not in out.columns]
     assert not missing, f"missing columns: {missing}"
@@ -96,9 +114,11 @@ def test_vwap_roll_and_session_consistency():
     pv = tp * df["volume"]
     num = pv.rolling(5, min_periods=5).sum()
     den = df["volume"].rolling(5, min_periods=5).sum()
-    manual_roll = (num / den.replace(0.0, np.nan))
+    manual_roll = num / den.replace(0.0, np.nan)
     got_roll = out["f_vwap_roll_5"]
-    assert np.allclose(got_roll.fillna(0.0).values, manual_roll.fillna(0.0).values, atol=1e-12, rtol=0)
+    assert np.allclose(
+        got_roll.fillna(0.0).values, manual_roll.fillna(0.0).values, atol=1e-12, rtol=0
+    )
 
     # сессионный VWAP в пределах одного дня = cumulative pv/v
     ts = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
@@ -107,7 +127,9 @@ def test_vwap_roll_and_session_consistency():
     v_cum = df["volume"].groupby(day).cumsum()
     manual_sess = pv_cum / v_cum.replace(0.0, np.nan)
     got_sess = out["f_vwap_session"]
-    assert np.allclose(got_sess.fillna(0.0).values, manual_sess.fillna(0.0).values, atol=1e-12, rtol=0)
+    assert np.allclose(
+        got_sess.fillna(0.0).values, manual_sess.fillna(0.0).values, atol=1e-12, rtol=0
+    )
 
 
 def test_valid_from_and_version_not_empty():
