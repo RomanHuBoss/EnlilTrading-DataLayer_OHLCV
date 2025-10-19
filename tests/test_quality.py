@@ -1,114 +1,95 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import pytest
 
-from ohlcv.quality.validator import DQ_BITS, QualityConfig, validate
+from ohlcv.core.validate import align_and_flag_gaps
+from ohlcv.io.parquet_store import write_idempotent
+from ohlcv.cli import main as cli_main
+
+MINUTE_MS = 60_000
 
 
-def _mk_1m_index(n, start="2024-01-01T00:00:00Z"):
-    return pd.date_range(pd.Timestamp(start), periods=n, freq="min", tz="UTC")
-
-
-def _mk_df(n=10, start="2024-01-01T00:00:00Z"):
-    idx = _mk_1m_index(n, start)
-    o = np.linspace(100, 100 + n - 1, n)
+def _mk_1m(n: int, start_iso: str = "2024-01-01T00:00:00Z") -> pd.DataFrame:
+    idx = pd.date_range(pd.Timestamp(start_iso), periods=n, freq="1T", tz="UTC")
+    o = np.linspace(100.0, 100.0 + n - 1, n)
     c = o + 0.1
     h = np.maximum(o, c)
-    low = np.minimum(o, c)
+    l = np.minimum(o, c)
     v = np.ones(n)
-    df = pd.DataFrame({"o": o, "h": h, "l": low, "c": c, "v": v}, index=idx)
-    return df
+    return pd.DataFrame({"o": o, "h": h, "l": l, "c": c, "v": v}, index=idx)
 
 
-def test_validate_empty_returns_empty():
-    df = pd.DataFrame(columns=["o", "h", "l", "c", "v"]).set_index(pd.DatetimeIndex([], tz="UTC"))
-    clean, issues = validate(df)
-    assert clean.shape[0] == 0
-    assert issues.shape[0] == 0
+def _with_gap(df: pd.DataFrame, start_i: int, end_i: int) -> pd.DataFrame:
+    drop_idx = df.index[start_i:end_i]
+    return df.drop(drop_idx)
 
 
-def test_fix_ohlc_invariants_and_neg_volume():
-    df = _mk_df(3)
-    # Нарушим инварианты на середине и отрицательный объём на последней
-    i1, i2 = df.index[1], df.index[2]
-    df.loc[i1, "h"] = min(df.loc[i1, "o"], df.loc[i1, "c"]) - 1.0
-    df.loc[i1, "l"] = max(df.loc[i1, "o"], df.loc[i1, "c"]) + 1.0
-    df.loc[i2, "v"] = -5.0
+def test_align_and_flag_gaps_rate():
+    # 120 минут, удалим 12 минут (10%)
+    full = _mk_1m(120)
+    sparse = _with_gap(full, 20, 32)  # 12 минут
 
-    clean, issues = validate(df, tf="1m", repair=True)
-    # Инварианты должны быть исправлены
-    assert (
-        clean.loc[i1, "h"] >= max(clean.loc[i1, "o"], clean.loc[i1, "c"])
-        and clean.loc[i1, "l"] <= min(clean.loc[i1, "o"], clean.loc[i1, "c"])
-        and clean.loc[i1, "l"] <= clean.loc[i1, "h"]
-    )
-    # Объём неотрицателен
-    assert clean.loc[i2, "v"] == 0.0
-    # dq_flags должен быть ненулевым хотя бы на этих строках
-    assert (clean.loc[[i1, i2], "dq_flags"] != 0).all()
+    aligned, stats = align_and_flag_gaps(sparse)
+    total = len(aligned)
+    gaps = int(aligned["is_gap"].sum())
+    gap_pct = gaps / total * 100.0
+
+    assert total == 120
+    assert gaps == 12
+    assert abs(gap_pct - 10.0) < 1e-9
 
 
-def test_missing_small_fill_sets_is_gap_and_flags():
-    df = _mk_df(10)
-    # Удалим две минуты внутри — сознательно большой порог, чтобы автозаполнение сработало
-    drop_idx = [df.index[3], df.index[7]]
-    df = df.drop(drop_idx)
+@pytest.mark.parametrize("threshold, expected_rc", [(5.0, 2), (15.0, 0)])
+def test_cli_report_missing_threshold(tmp_path: Path, threshold: float, expected_rc: int):
+    # Подготовка хранилища с пропусками ≈10%
+    root = tmp_path
+    sym = "TEST"
 
-    cfg = QualityConfig(missing_fill_threshold=0.5)  # разрешим заполнение
-    clean, issues = validate(df, tf="1m", repair=True, config=cfg)
+    full = _mk_1m(120)
+    sparse = _with_gap(full, 10, 22)  # 12/120 = 10%
 
-    # Должны восстановиться 10 строк
-    assert clean.shape[0] == 10
-    # На вставленных строках должен стоять флаг is_gap и соответствующий dq_flag
-    gap_rows = clean.loc[drop_idx]
-    assert gap_rows["is_gap"].astype(bool).all()
-    assert (gap_rows["dq_flags"] != 0).all()
-    assert (issues["code"] == "MISSING").any()
+    write_idempotent(root, sym, "1m", sparse)
 
+    start_ms = int(full.index[0].value // 1_000_000)
+    end_ms = int(full.index[-1].value // 1_000_000 + MINUTE_MS)
 
-def test_misaligned_ts_are_shifted_to_right_edges():
-    # Искусственно создадим метки, не совпадающие с правыми границами минут
-    base = pd.Timestamp("2024-01-01T00:00:00Z")
-    idx = pd.DatetimeIndex(
-        [base + pd.Timedelta(seconds=10), base + pd.Timedelta(minutes=1, seconds=10)], tz="UTC"
-    )
-    df = pd.DataFrame(
-        {
-            "o": [100.0, 101.0],
-            "h": [101.0, 102.0],
-            "l": [99.0, 100.5],
-            "c": [100.5, 101.5],
-            "v": [1.0, 2.0],
-        },
-        index=idx,
-    )
-
-    cfg = QualityConfig(misaligned_tolerance_seconds=1)
-    clean, issues = validate(df, tf="1m", repair=True, config=cfg)
-
-    # Ожидаем метки ровно на границах минут: 00:01 и 00:02 (правая граница окна)
-    assert (
-        clean.index
-        == pd.DatetimeIndex(
-            [base + pd.Timedelta(minutes=1), base + pd.Timedelta(minutes=2)], tz="UTC"
-        )
-    ).all()
-    # Наличие issue MISALIGNED_TS
-    assert (issues["code"] == "MISALIGNED_TS").any()
+    rc = cli_main([
+        "report-missing",
+        "--symbol", sym,
+        "--store", str(root),
+        "--since-ms", str(start_ms),
+        "--until-ms", str(end_ms),
+        "--fail-gap-pct", str(threshold),
+    ])
+    assert rc == expected_rc
 
 
-def test_dq_notes_correspond_to_flags():
-    df = _mk_df(1)
-    # Сгенерируем конфликт инвариантов
-    df.loc[df.index[0], ["h", "l"]] = [
-        df.loc[df.index[0], "o"] - 1.0,
-        df.loc[df.index[0], "c"] + 1.0,
-    ]
-    clean, issues = validate(df, tf="1m", repair=True)
-    flags = int(clean.iloc[0]["dq_flags"])
-    notes = clean.iloc[0]["dq_notes"]
-    if flags == 0:
-        assert notes == ""
-    else:
-        # Каждая пометка из notes должна соответствовать установленному биту
-        for tag in notes.split(";"):
-            assert (flags & (1 << DQ_BITS[tag])) != 0
+def test_cli_report_missing_payload(tmp_path: Path, capsys):
+    root = tmp_path
+    sym = "BTCUSDT"
+
+    full = _mk_1m(60)
+    sparse = _with_gap(full, 0, 6)  # 6/60 = 10%
+    write_idempotent(root, sym, "1m", sparse)
+
+    start_ms = int(full.index[0].value // 1_000_000)
+    end_ms = int(full.index[-1].value // 1_000_000 + MINUTE_MS)
+
+    rc = cli_main([
+        "report-missing",
+        "--symbol", sym,
+        "--store", str(root),
+        "--since-ms", str(start_ms),
+        "--until-ms", str(end_ms),
+    ])
+    assert rc == 0
+
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)
+    assert payload["symbol"] == sym
+    assert payload["total_minutes"] == 60
+    assert payload["gaps"] == 6
+    assert abs(float(payload["gap_pct"]) - 10.0) < 1e-9

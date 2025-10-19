@@ -1,16 +1,21 @@
-"""Parquet Store: idempotent append/merge with metadata.
+"""Parquet Store: идемпотентная запись и слияние по минутным барам.
 
-- Columnar Parquet.
-- Idempotent merge on "ts" (UTC minute right edges). New rows win on collision.
-- Stable file metadata: minimal JSON blob under the "c1.meta" key.
-- ZSTD compression, reasonable row group size.
-- Note: "ts" is stored as a column (not as index). Input df index must be tz-aware UTC.
+Изменения:
+- ZSTD level = 7, row_group_size = 256_000, use_dictionary = True.
+- Стабильные метаданные в footer под ключом "c1.meta":
+  {
+    symbol, tf, rows, min_ts, max_ts, generated_at,
+    data_hash, content_sha1(back-compat), build_signature,
+    schema, schema_version, zstd_level, row_group_size
+  }
+- Идемпотентный merge по 'ts' с приоритетом новых строк.
+- Жёстная нормализация типов и сортировка по времени.
 """
-
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List, Tuple
@@ -20,12 +25,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 PARQUET_COMPRESSION = "zstd"
-PARQUET_COMPRESSION_LEVEL = 6
-PARQUET_ROW_GROUP_SIZE = 64_000
+PARQUET_COMPRESSION_LEVEL = 7
+PARQUET_ROW_GROUP_SIZE = 256_000
+SCHEMA_VERSION = 1
 
 
 def parquet_path(root: Path | str, symbol: str, tf: str) -> Path:
-    """Return canonical path: <root>/<symbol>/<tf>.parquet."""
+    """Канонический путь: <root>/<symbol>/<tf>.parquet."""
     root_p = Path(root).expanduser().resolve()
     return root_p / symbol / f"{tf}.parquet"
 
@@ -67,16 +73,42 @@ def _order_columns(df: pd.DataFrame) -> List[str]:
     return cols + tail
 
 
+def _canonical_content_hash(df: pd.DataFrame) -> str:
+    # Стабильный хэш содержимого: сортировка по ts, NaN→0 для детерминизма.
+    df_sorted = df.sort_values("ts").reset_index(drop=True)
+    h = pd.util.hash_pandas_object(df_sorted.fillna(0), index=True).values.tobytes()
+    return hashlib.sha1(h).hexdigest()
+
+
+def _build_signature() -> str:
+    # Источник: версия пакета + внешняя переменная окружения с git-commit (если есть)
+    try:
+        from ohlcv import __version__  # lazy-import, чтобы избежать циклов
+    except Exception:
+        __version__ = "0.0.0"  # type: ignore
+    git_sha = os.getenv("GIT_COMMIT") or os.getenv("CI_COMMIT_SHA") or os.getenv("SOURCE_VERSION")
+    if git_sha:
+        git_tag = git_sha[:8]
+        return f"C1-{__version__}+g{git_tag}"
+    return f"C1-{__version__}"
+
+
 def _meta_blob(symbol: str, tf: str, df: pd.DataFrame) -> bytes:
+    ts = pd.to_datetime(df["ts"], utc=True)
     payload = {
         "symbol": symbol,
         "tf": tf,
         "rows": int(len(df)),
+        "min_ts": (ts.min().isoformat() if not df.empty else None),
+        "max_ts": (ts.max().isoformat() if not df.empty else None),
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "content_sha1": hashlib.sha1(
-            pd.util.hash_pandas_object(df.fillna(0), index=True).values.tobytes()
-        ).hexdigest(),
+        "data_hash": _canonical_content_hash(df),
+        "content_sha1": _canonical_content_hash(df),  # back-compat с прежним ключом
+        "build_signature": _build_signature(),
         "schema": [str(c) for c in df.columns],
+        "schema_version": SCHEMA_VERSION,
+        "zstd_level": PARQUET_COMPRESSION_LEVEL,
+        "row_group_size": PARQUET_ROW_GROUP_SIZE,
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -96,20 +128,17 @@ def _to_pa_table(df: pd.DataFrame, symbol: str, tf: str) -> pa.Table:
             continue
         arrays.append((c, pa.array(df[c])))
 
-    tbl = pa.Table.from_arrays(
-        [arr for _, arr in arrays],
-        names=[name for name, _ in arrays],
-    )
+    tbl = pa.Table.from_arrays([arr for _, arr in arrays], names=[name for name, _ in arrays])
     md = {"c1.meta": _meta_blob(symbol, tf, df)}
     tbl = tbl.replace_schema_metadata(md)
     return tbl
 
 
 def write_idempotent(root: Path | str, symbol: str, tf: str, df: pd.DataFrame) -> Path:
-    """Idempotent write:
-    - create parent directories
-    - merge with existing file on 'ts', prioritising new rows
-    - write Parquet with "c1.meta" metadata
+    """Идемпотентная запись:
+    - создаёт каталоги
+    - сливает с существующим файлом по 'ts' (новые строки побеждают)
+    - пишет Parquet с обновлёнными метаданными
     """
     path = parquet_path(root, symbol, tf)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,7 +156,7 @@ def write_idempotent(root: Path | str, symbol: str, tf: str, df: pd.DataFrame) -
         df = df.reindex(columns=all_cols)
         old = old.reindex(columns=all_cols)
         merged = old.combine_first(df)
-        merged.update(df)  # новые значения побеждают в коллизиях
+        merged.update(df)  # новые значения побеждают
         out = merged.sort_index()
     else:
         out = df

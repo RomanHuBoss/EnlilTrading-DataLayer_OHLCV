@@ -1,91 +1,73 @@
 [build-system]
-requires = ["setuptools>=68", "wheel", "setuptools-scm>=8"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ohlcv-pipeline"
-version = "0.3.1"
-description = "OHLCV pipeline: C1 (DataLayer), C2 (DataQuality), C3 (Features.Core)"
-readme = "README.md"
+name = "c1-ohlcv"
+version = "0.1.0"
+description = "Пайплайн C1+C3 (+C4 опционально): минутные OHLCV, Parquet-хранилище, ресемплинг, признаки, режимы"
 authors = [{ name = "Project" }]
-license = { text = "MIT" }
-requires-python = ">=3.11"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+keywords = ["ohlcv", "bybit", "parquet", "resample", "data-quality", "features", "regime"]
+
+# Базовый слой (C1/C3): только необходимые зависимостии
+# C4 выведен в extras "regime".
 dependencies = [
-  "numpy>=1.26",
-  "pandas>=2.2",
-  "pyarrow>=15",
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "pyarrow>=12",
   "requests>=2.31",
-  "filelock>=3.12",
-  "pyyaml>=6",
 ]
 
 [project.optional-dependencies]
+# Запуск тестов
+test = [
+  "pytest>=7.4",
+]
+# Разработка
 dev = [
-  "pytest>=7",
-  "pytest-cov>=4",
-  "ruff>=0.6.8",
-  "black>=24.8.0",
-  "isort>=5.13.2",
-  "mypy>=1.8",
-  "numba>=0.59",
-  "pandas-stubs>=2",
-  "types-requests",
-  "types-PyYAML",
+  "pytest>=7.4",
+  "black>=23.0",
+  "isort>=5.12",
+  "mypy>=1.5",
+]
+# Режимы рынка (C4): ставится при необходимости
+regime = [
+  "scikit-learn>=1.2",
+  "hmmlearn>=0.3.0",
+  "ruptures>=1.1.7",
+]
+# Удобный агрегат
+all = [
+  "c1-ohlcv[test]",
+  "c1-ohlcv[dev]",
+  "c1-ohlcv[regime]",
 ]
 
 [project.scripts]
+# CLI C1
 c1-ohlcv = "ohlcv.cli:main"
-features-core = "ohlcv.features.cli:main"
+# CLI C3
+c3-features = "ohlcv.features.cli:main"
+# CLI C4 (доступен при установке extras "regime")
+c4-regime = "c4_regime.cli:main"
 
-[tool.pytest.ini_options]
-addopts = "-q"
-
-[tool.black]
-line-length = 100
-target-version = ["py311"]
-
-[tool.isort]
-profile = "black"
-line_length = 100
-known_first_party = ["ohlcv"]
-
-[tool.ruff]
-line-length = 100
-src = ["ohlcv", "tests"]
-
-[tool.ruff.lint]
-select = ["E", "F", "I"]
-
-[tool.ruff.lint.isort]
-known-first-party = ["ohlcv"]
-
-[tool.mypy]
-python_version = "3.11"
-strict = true
-packages = ["ohlcv"]
-
-[[tool.mypy.overrides]]
-module = [
-  "pandas",
-  "pandas.*",
-  "requests",
-  "yaml",
-  "pyarrow",
-  "pyarrow.*",
-  "numpy",
-  "numpy.*",
-]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = [
-  "ohlcv.cli",
-  "ohlcv.features.cli",
-]
-disallow_untyped_defs = false
-check_untyped_defs = false
-warn_return_any = false
+[tool.setuptools]
+include-package-data = true
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["ohlcv*"]
+# Включаем и C1/C3 (ohlcv*), и C4 (c4_regime*)
+include = ["ohlcv*", "c4_regime*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+# На случай локальных YAML/конфигов внутри пакетов
+"ohlcv" = ["**/*.yaml", "**/*.yml"]
+"c4_regime" = ["**/*.yaml", "**/*.yml"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q"
+python_files = ["test_*.py"]

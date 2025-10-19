@@ -2,8 +2,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from ohlcv.core.resample import resample_ohlcv
-from ohlcv.core.validate import ensure_missing_threshold, missing_rate, validate_1m_index
+from ohlcv.core.resample import resample_1m_to
+from ohlcv.core.validate import normalize_ohlcv_1m, align_and_flag_gaps
 
 
 def _mk_df(n: int, start: str = "2024-01-01T00:00:00Z") -> pd.DataFrame:
@@ -16,25 +16,33 @@ def _mk_df(n: int, start: str = "2024-01-01T00:00:00Z") -> pd.DataFrame:
     return pd.DataFrame({"o": o, "h": h, "l": low, "c": c, "v": v}, index=idx)
 
 
-def test_validate_1m_index_ok() -> None:
+def test_normalize_1m_ok() -> None:
     df = _mk_df(10)
-    validate_1m_index(df)
+    out, stats = normalize_ohlcv_1m(df)
+    assert out.index.tz is not None and out.index.is_monotonic_increasing
+    assert set(["o", "h", "l", "c", "v"]).issubset(out.columns)
+    assert stats.rows_in == 10 and stats.rows_out == 10
 
 
 def test_resample_basic_to_5m() -> None:
     df = _mk_df(10)
-    out = resample_ohlcv(df, "5m")
+    out = resample_1m_to(df, "5m")
     assert out.shape[0] == 2
-    assert set(out.columns) == {"o", "h", "l", "c", "v"}
+    assert set(out.columns) >= {"o", "h", "l", "c", "v", "is_gap"}
     assert isinstance(out.index, pd.DatetimeIndex) and out.index.tz is not None
     assert out.index.is_monotonic_increasing
 
 
-def test_missing_threshold() -> None:
+def test_missing_rate_alignment() -> None:
     df = _mk_df(100)
     drop_idx = df.index[10:20]
     df = df.drop(drop_idx)
-    r = missing_rate(df)
-    assert 0.09 < r < 0.11
-    with pytest.raises(ValueError):
-        ensure_missing_threshold(df, threshold=0.05)
+
+    aligned, stats = align_and_flag_gaps(df)
+    total = len(aligned)
+    gaps = int(aligned["is_gap"].sum())
+    rate = gaps / total
+    assert 0.09 < rate < 0.11
+
+    # Порог 5% должен считаться превышенным
+    assert rate > 0.05

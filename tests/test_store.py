@@ -1,54 +1,96 @@
+import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
+import pytest
 
-from ohlcv.io.parquet_store import write_idempotent
+pa = pytest.importorskip("pyarrow")  # требуется для parquet
+pq = pytest.importorskip("pyarrow.parquet")
+
+from ohlcv.io.parquet_store import write_idempotent, parquet_path
 
 
-def _mk_df(n: int, start: str = "2024-01-01T00:00:00Z") -> pd.DataFrame:
-    idx = pd.date_range(pd.Timestamp(start), periods=n, freq="min", tz="UTC")
+def _mk_1m(n: int, start: str = "2024-01-01T00:00:00Z", with_t: bool = True, with_gap: bool = True) -> pd.DataFrame:
+    idx = pd.date_range(pd.Timestamp(start), periods=n, freq="1T", tz="UTC")
     o = np.linspace(100.0, 100.0 + n - 1, n)
     c = o + 0.1
     h = np.maximum(o, c)
-    low = np.minimum(o, c)
+    l = np.minimum(o, c)
     v = np.ones(n)
-    return pd.DataFrame({"o": o, "h": h, "l": low, "c": c, "v": v}, index=idx)
+    df = pd.DataFrame({"o": o, "h": h, "l": l, "c": c, "v": v}, index=idx)
+    if with_t:
+        df["t"] = (df["o"] + df["h"] + df["l"] + df["c"]) / 4.0
+    if with_gap:
+        df["is_gap"] = False
+    return df
 
 
-def test_write_and_merge(tmp_path: Path) -> None:
+def test_parquet_path_layout(tmp_path: Path):
+    p = parquet_path(tmp_path, "BTCUSDT", "1m")
+    assert str(p).endswith("BTCUSDT/1m.parquet")
+
+
+def test_write_and_merge_idempotent(tmp_path: Path):
     root = tmp_path
     sym = "BTCUSDT"
-    tf = "1m"
 
-    df1 = _mk_df(10, "2024-01-01T00:00:00Z")
-    out1 = write_idempotent(root, sym, tf, df1)
-    assert out1.exists()
+    df1 = _mk_1m(5)
+    path = write_idempotent(root, sym, "1m", df1)
+    assert Path(path).exists()
 
-    read1 = pd.read_parquet(out1)
-    assert read1.shape[0] == 10
-    assert "ts" in read1.columns
+    got = pd.read_parquet(path)
+    assert set(["ts", "o", "h", "l", "c", "v"]).issubset(got.columns)
+    assert len(got) == 5
 
-    df2 = _mk_df(10, "2024-01-01T00:05:00Z").copy()
-    df2["c"] = df2["c"] + 1.0
-    out2 = write_idempotent(root, sym, tf, df2)
-    assert out2 == out1
+    # перекрывающаяся вставка: последние 2 минуты с другими значениями close
+    df2 = df1.iloc[-2:].copy()
+    df2["c"] = df2["c"] + 10.0
+    path2 = write_idempotent(root, sym, "1m", df2)
+    assert path2 == path
 
-    read2 = pd.read_parquet(out2)
-    assert read2.shape[0] == 15
+    got2 = pd.read_parquet(path)
+    # новые значения победили
+    tail_close = got2["c"].astype(float).tail(2).to_numpy()
+    assert np.allclose(tail_close, df2["c"].to_numpy())
+    # без дубликатов по времени
+    ts = pd.to_datetime(got2["ts"], utc=True)
+    assert ts.is_monotonic_increasing and not ts.duplicated().any()
 
-    ts_overlap = pd.Timestamp("2024-01-01T00:10:00Z", tz="UTC")
-    row = read2.loc[read2["ts"] == ts_overlap]
-    assert not row.empty
 
-    df2_ts = df2.reset_index().rename(columns={"index": "ts"})
-    df2_ts["ts"] = pd.to_datetime(df2_ts["ts"], utc=True)
-    expected_close = float(df2_ts.loc[df2_ts["ts"] == ts_overlap, "c"].iloc[0])
-    assert abs(float(row["c"].iloc[0]) - expected_close) < 1e-12
+def test_footer_metadata_and_params(tmp_path: Path):
+    root = tmp_path
+    sym = "ETHUSDT"
 
-    md = pq.read_table(out2).schema.metadata or {}
-    assert b"c1.meta" in md
+    df = _mk_1m(3)
+    path = write_idempotent(root, sym, "1m", df)
 
-    cols = list(read2.columns)
-    assert cols[:6] == ["ts", "o", "h", "l", "c", "v"]
+    # проверяем наличие user-metadata "c1.meta"
+    md = pq.read_metadata(path)
+    meta = md.metadata or {}
+    assert b"c1.meta" in meta
+    payload = json.loads(meta[b"c1.meta"].decode("utf-8"))
+
+    # обязательные поля
+    for k in ("symbol", "tf", "rows", "min_ts", "max_ts", "generated_at", "data_hash", "build_signature", "schema", "schema_version", "zstd_level", "row_group_size"):
+        assert k in payload
+
+    assert payload["symbol"] == sym
+    assert payload["tf"] == "1m"
+    assert int(payload["rows"]) >= 3
+    assert int(payload["zstd_level"]) == 7
+    assert int(payload["row_group_size"]) == 256_000
+
+
+def test_optional_columns_preserved_and_order(tmp_path: Path):
+    root = tmp_path
+    sym = "SOLUSDT"
+
+    df = _mk_1m(4, with_t=True, with_gap=True)
+    path = write_idempotent(root, sym, "1m", df)
+
+    got = pd.read_parquet(path)
+    cols = list(got.columns)
+    # порядок: ts, o,h,l,c,v, затем t, затем is_gap, затем хвост
+    expected_prefix = ["ts", "o", "h", "l", "c", "v", "t", "is_gap"]
+    assert cols[: len(expected_prefix)] == expected_prefix[: len(cols)]

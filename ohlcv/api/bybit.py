@@ -1,284 +1,210 @@
-# ohlcv/api/bybit.py — Bybit v5 REST, публичные эндпоинты для OHLCV 1m и launchTime
+# ohlcv/api/bybit.py
 from __future__ import annotations
 
+import math
+import random
 import time
-from datetime import datetime, timezone
-from typing import (
-    Any,
-    Callable,
-    Generator,
-    List,
-    Mapping,
-    MutableMapping,
-    Optional,
-    Sequence,
-    TypedDict,
-)
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Tuple
 
+import pandas as pd
 import requests
 
-BASE_URL = "https://api.bybit.com"
-USER_AGENT = "EnlilTrading-DataLayer/1.0 (python-requests)"
-
-KLINE_LIMIT = 1000  # limit<=1000, интервал 1m → "1"
-RATE_LIMIT_CODES = {"10006"}
+MINUTE_MS = 60_000
 
 
-class KlineRow(TypedDict, total=False):
-    ts: str
-    o: float
-    h: float
-    l: float  # noqa: E741 — оставляем ключ 'l' ради совместимости со схемой C1/C2
-    c: float
-    v: float
-    t: float
+@dataclass(frozen=True)
+class FetchStats:
+    symbol: str
+    category: str
+    rows: int
+    start_ms: int
+    end_ms: int
+    requests: int
+    retries: int
+    rate_limited: int
 
 
-def _parse_retry_after_seconds(resp: requests.Response) -> Optional[float]:
-    h = resp.headers or {}
-    for k in ("Retry-After", "retry-after"):
-        if k in h:
+class BybitClient:
+    """Минимальный HTTP‑клиент для публичных OHLCV Bybit v5.
+
+    Основной метод: fetch_ohlcv_1m(symbol, start_ms, end_ms, ...)
+    Возвращает (DataFrame, FetchStats).
+    """
+
+    def __init__(
+        self,
+        base_url: str = "https://api.bybit.com",
+        *,
+        timeout: int = 30,
+        session: Optional[requests.Session] = None,
+        default_category: str = "linear",
+        max_retries: int = 5,
+        jitter: float = 0.2,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.s = session or requests.Session()
+        self.default_category = default_category
+        self.max_retries = max_retries
+        self.jitter = float(jitter)
+
+    # -------------------------
+    # Низкоуровневый запрос c backoff
+    # -------------------------
+    def _sleep(self, seconds: float) -> None:
+        time.sleep(max(0.0, seconds))
+
+    def _backoff_seconds(self, attempt: int, base: float = 0.5, cap: float = 60.0) -> float:
+        expo = base * (2.0 ** attempt)
+        jitter = random.uniform(-self.jitter, self.jitter) * expo
+        return float(min(cap, expo + jitter))
+
+    def _request(self, path: str, params: Dict[str, object]) -> Tuple[requests.Response, int, bool]:
+        url = f"{self.base_url}{path}"
+        tries = 0
+        rate_limited = 0
+        while True:
+            tries += 1
             try:
-                return float(h[k])
-            except Exception:
-                pass
-    now = time.time()
-    for k in (
-        "X-RateLimit-Reset",
-        "X-Rate-Limit-Reset",
-        "X-Bapi-Limit-Reset-Timestamp",
-        "X-Bapi-Rate-Limit-Reset-Timestamp",
-    ):
-        if k in h:
-            val = h[k]
-            try:
-                ts = float(val)
-                if ts > 10_000_000_000:
-                    ts /= 1000.0
-                wait = max(0.0, ts - now)
-                if wait > 0:
-                    return wait
-            except Exception:
-                pass
-    try:
-        data = resp.json()
-        ext = data.get("retExtInfo") or {}
-        for k in ("retryAfter", "waitSec", "nextValidTimestamp"):
-            if k in ext:
-                v = float(ext[k])
-                if v > 10_000_000_000:
-                    v /= 1000.0
-                if k == "nextValidTimestamp":
-                    return max(0.0, v - time.time())
-                return max(0.0, v)
-    except Exception:
-        pass
-    return None
-
-
-def _http_get(
-    path: str,
-    params: Mapping[str, str | int | float | None],
-    headers: Mapping[str, str] | None = None,
-    *,
-    timeout: int = 20,
-    max_retries: int = 10,
-    backoff_base: float = 0.4,
-) -> requests.Response:
-    url = f"{BASE_URL}{path}"
-    h: MutableMapping[str, str] = {"User-Agent": USER_AGENT}
-    if headers:
-        h.update(headers)
-
-    last_err: Optional[Exception] = None
-    sleep = backoff_base
-
-    for attempt in range(max_retries + 1):
-        try:
-            r = requests.get(
-                url,
-                params={k: v for k, v in params.items() if v is not None},
-                headers=h,
-                timeout=timeout,
-            )
-            if r.status_code >= 500:
-                raise requests.HTTPError(f"{r.status_code} {r.text[:200]}")
-            if r.status_code == 429:
-                wait = _parse_retry_after_seconds(r) or sleep
-                time.sleep(wait)
-                sleep = min(sleep * 2, 8.0)
+                resp = self.s.get(url, params=params, timeout=self.timeout)
+            except requests.RequestException:
+                if tries > self.max_retries:
+                    raise
+                self._sleep(self._backoff_seconds(tries))
                 continue
-            try:
-                data = r.json()
-                rc = str(data.get("retCode"))
-                if rc in RATE_LIMIT_CODES:
-                    wait = _parse_retry_after_seconds(r) or sleep
-                    time.sleep(wait)
-                    sleep = min(sleep * 2, 8.0)
-                    continue
-            except Exception:
-                pass
-            return r
-        except Exception as e:
-            last_err = e
-            if attempt >= max_retries:
-                break
-            time.sleep(sleep)
-            sleep = min(sleep * 2, 8.0)
 
-    if isinstance(last_err, Exception):
-        raise last_err
-    raise RuntimeError("HTTP GET failed with unknown error")
+            status = resp.status_code
+            if status == 429:
+                rate_limited += 1
+                retry_after = resp.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else self._backoff_seconds(tries)
+                if tries > self.max_retries:
+                    resp.raise_for_status()
+                self._sleep(delay)
+                continue
+            if 500 <= status < 600:
+                if tries > self.max_retries:
+                    resp.raise_for_status()
+                self._sleep(self._backoff_seconds(tries))
+                continue
+            if status >= 400:
+                # 4xx — фатальная ошибка параметров/символа
+                resp.raise_for_status()
+            return resp, tries, bool(rate_limited)
 
+    # -------------------------
+    # Нормализация ответа v5/market/kline
+    # -------------------------
+    @staticmethod
+    def _parse_kline_rows(rows: Iterable[Iterable[object]]) -> pd.DataFrame:
+        # Формат по документации v5: [start, open, high, low, close, volume, turnover]
+        col_names = ["start", "open", "high", "low", "close", "volume", "turnover"]
+        df = pd.DataFrame(list(rows), columns=col_names)
+        # приведение типов
+        for c in ["open", "high", "low", "close", "volume", "turnover"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["start"] = pd.to_numeric(df["start"], errors="coerce").astype("int64")
+        # сортировка по возрастанию времени и удаление дубликатов
+        df = df.dropna(subset=["start"]).drop_duplicates(subset=["start"], keep="last").sort_values("start")
+        # фильтрация на ровные минуты
+        df = df[(df["start"] % MINUTE_MS) == 0]
+        # построение индексированного OHLCV
+        idx = pd.to_datetime(df["start"], unit="ms", utc=True)
+        out = pd.DataFrame(index=idx)
+        out.index.name = "ts"
+        out["o"] = df["open"].astype("float64")
+        out["h"] = df["high"].astype("float64")
+        out["l"] = df["low"].astype("float64")
+        out["c"] = df["close"].astype("float64")
+        out["v"] = df.get("volume", 0.0).astype("float64")
+        if "turnover" in df.columns:
+            out["t"] = df["turnover"].astype("float64")
+        return out
 
-def _iso_from_ms(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+    # -------------------------
+    # Публичный метод выгрузки 1m
+    # -------------------------
+    def fetch_ohlcv_1m(
+        self,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        category: Optional[str] = None,
+        limit: int = 1000,
+        slice_minutes: int = 1_000,  # запас по окну; 1000 минут ≈ 16.6 часов
+    ) -> Tuple[pd.DataFrame, FetchStats]:
+        """Выгружает минутные свечи [start_ms, end_ms) c пагинацией и backoff.
 
+        Ограничение Bybit: limit<=1000. Для стабильности режем диапазон по кускам slice_minutes,
+        подбирая end для каждого запроса.
+        """
+        if end_ms <= start_ms:
+            empty = pd.DataFrame(columns=["o", "h", "l", "c", "v"], index=pd.DatetimeIndex([], name="ts", tz="UTC"))
+            return empty, FetchStats(symbol, category or self.default_category, 0, start_ms, end_ms, 0, 0, 0)
 
-def _rows_from_kline_list(lst: Sequence[Sequence[str]]) -> List[KlineRow]:
-    out: List[KlineRow] = []
-    for it in lst:
-        start_ms = int(it[0])
-        o = float(it[1])
-        high = float(it[2])
-        low = float(it[3])
-        c = float(it[4])
-        v = float(it[5])
-        ts_iso = _iso_from_ms(start_ms + 60_000)
-        row: KlineRow = {"ts": ts_iso, "o": o, "h": high, "l": low, "c": c, "v": v}
-        if len(it) > 6:
-            try:
-                row["t"] = float(it[6])
-            except Exception:
-                pass
-        out.append(row)
-    return out
+        cat = (category or self.default_category)
+        all_parts: List[pd.DataFrame] = []
+        total_requests = 0
+        total_retries = 0
+        rate_limited = 0
 
+        cursor = int(start_ms)
+        max_span_ms = int(slice_minutes) * MINUTE_MS
+        if limit <= 0 or limit > 1000:
+            limit = 1000
 
-def iter_klines_1m(
-    symbol: str,
-    since: datetime,
-    until: datetime,
-    *,
-    api_key: Optional[str] = None,
-    api_secret: Optional[str] = None,
-    category: str = "spot",
-    on_advance: Optional[Callable[[int, int], None]] = None,
-    timeout: int = 20,
-    max_retries: int = 5,
-    sleep_sec: float = 0.25,
-) -> Generator[List[KlineRow], None, None]:
-    if since.tzinfo is None:
-        since = since.replace(tzinfo=timezone.utc)
-    if until.tzinfo is None:
-        until = until.replace(tzinfo=timezone.utc)
-    if since >= until:
-        return
+        while cursor < end_ms:
+            window_end = min(end_ms, cursor + max_span_ms)
+            params = {
+                "category": cat,           # "linear" | "inverse" | "spot"
+                "symbol": symbol,
+                "interval": "1",
+                "start": cursor,
+                "end": window_end - 1,    # правую границу делаем включительной
+                "limit": int(limit),
+            }
 
-    start_ms = int(since.timestamp() * 1000)
-    end_ms_initial = int(until.timestamp() * 1000)
+            resp, tries, rl = self._request("/v5/market/kline", params)
+            total_requests += 1
+            total_retries += max(0, tries - 1)
+            rate_limited += int(rl)
 
-    path = "/v5/market/kline"
-    params_base: dict[str, str | int] = {
-        "category": category,
-        "symbol": symbol,
-        "interval": "1",
-        "limit": KLINE_LIMIT,
-    }
+            data = resp.json()
+            if not isinstance(data, dict) or "result" not in data:
+                raise RuntimeError("некорректный ответ Bybit: отсутствует поле 'result'")
+            result = data.get("result") or {}
+            rows = result.get("list") or result.get("kline", [])
 
-    window_end = end_ms_initial
-    step_ms = KLINE_LIMIT * 60_000
+            part = self._parse_kline_rows(rows)
+            if not part.empty:
+                # фильтр по [cursor, window_end)
+                mask = (part.index.view("int64") // 1_000_000 >= cursor) & (part.index.view("int64") // 1_000_000 < window_end)
+                part = part.loc[mask]
+                all_parts.append(part)
+                # сдвиг курсора на последнюю минуту + 60_000
+                last_ts_ms = int(part.index[-1].value // 1_000_000)
+                cursor = max(cursor + MINUTE_MS, last_ts_ms + MINUTE_MS)
+            else:
+                # пустой блок — маленький шаг вперёд, чтобы не залипать
+                cursor = min(end_ms, cursor + limit * MINUTE_MS)
 
-    while window_end > start_ms:
-        params: dict[str, int | str] = dict(params_base)
-        params["start"] = start_ms
-        params["end"] = window_end
+        if all_parts:
+            out = pd.concat(all_parts).sort_index()
+            out = out[~out.index.duplicated(keep="last")]
+        else:
+            out = pd.DataFrame(columns=["o", "h", "l", "c", "v"], index=pd.DatetimeIndex([], name="ts", tz="UTC"))
 
-        r = _http_get(
-            path, params, timeout=timeout, max_retries=10, backoff_base=max(sleep_sec, 0.25)
+        stats = FetchStats(
+            symbol=symbol,
+            category=cat,
+            rows=int(len(out)),
+            start_ms=int(start_ms),
+            end_ms=int(end_ms),
+            requests=int(total_requests),
+            retries=int(total_retries),
+            rate_limited=int(rate_limited),
         )
-        data: dict[str, Any] = r.json()
-        if str(data.get("retCode")) != "0":
-            raise RuntimeError(f"Bybit error: {data.get('retCode')} {data.get('retMsg')}")
-        result = data.get("result") or {}
-        lst = result.get("list") or []
-
-        if not lst:
-            new_end = max(start_ms, window_end - step_ms)
-            if new_end == window_end:
-                break
-            window_end = new_end
-            if on_advance:
-                on_advance(window_end, end_ms_initial)
-            time.sleep(sleep_sec)
-            continue
-
-        lst_sorted = sorted(lst, key=lambda x: int(x[0]))
-        rows = _rows_from_kline_list(lst_sorted)
-        yield rows
-
-        earliest_start_ms = int(lst_sorted[0][0])
-        if earliest_start_ms <= start_ms:
-            break
-        window_end = earliest_start_ms - 60_000
-
-        if on_advance:
-            on_advance(window_end, end_ms_initial)
-        time.sleep(sleep_sec)
-
-
-def fetch_klines_1m(
-    symbol: str,
-    since: datetime,
-    until: datetime,
-    *,
-    api_key: Optional[str] = None,
-    api_secret: Optional[str] = None,
-    category: str = "spot",
-    timeout: int = 20,
-    max_retries: int = 5,
-) -> List[KlineRow]:
-    acc: List[KlineRow] = []
-    for chunk in iter_klines_1m(
-        symbol,
-        since,
-        until,
-        api_key=api_key,
-        api_secret=api_secret,
-        category=category,
-        timeout=timeout,
-        max_retries=max_retries,
-    ):
-        acc.extend(chunk)
-    return acc
-
-
-def get_launch_time(
-    symbol: str,
-    *,
-    category: str = "spot",
-    timeout: int = 20,
-    max_retries: int = 5,
-) -> Optional[datetime]:
-    path = "/v5/market/instruments-info"
-    params: Mapping[str, str] = {"category": category, "symbol": symbol}
-    r = _http_get(path, params, timeout=timeout, max_retries=max_retries)
-    data: dict[str, Any] = r.json()
-    if str(data.get("retCode")) != "0":
-        return None
-    result = data.get("result") or {}
-    lst = result.get("list") or []
-    if not lst:
-        return None
-    candidates: List[int] = []
-    for it in lst:
-        for key in ("launchTime", "createdTime", "listTime"):
-            if key in it and it[key] is not None:
-                try:
-                    candidates.append(int(it[key]))
-                except Exception:
-                    pass
-    if not candidates:
-        return None
-    ms = min(candidates)
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        return out, stats

@@ -1,140 +1,173 @@
-# OHLCV Pipeline — C1 / C2 / C3
+# Проект: Маркет‑данные и режимы рынка
 
-Назначение: единый репозиторий для трёх компонентов пайплайна по временным рядам рынка:
-C1 — загрузка и нормализация OHLCV,
-C2 — контроль качества и подготовка валидированных артефактов,
-C3 — расчёт детерминированных признаков поверх валидированных баров.
+Комплект модулей для загрузки минутных OHLCV (Bybit), очистки и выравнивания, ресемплинга в целевые ТФ, построения признаков и (опционально) детекции рыночных режимов.
 
-## Состав компонентов
+Состав:
+- **C1 · Data Layer (OHLCV)** — загрузка 1m по Bybit, нормализация, календаризация, Parquet‑хранилище, ресемплинг 1m→5m/15m/1h, отчёты по пропускам, DataReader.
+- **C2 · Data Quality** — инварианты OHLC, выравнивание к минутному календарю, флаг `is_gap`, агрегированные отчёты и порог для CI. Реализовано внутри `ohlcv.core.validate` и CLI `report-missing` (см. ниже).
+- **C3 · Features** — минимальный согласованный набор признаков по постановке: волатильность, тренд/импульс, свечные относительные метрики, VWAP, объёмные показатели, Donchian и т.п. CLI `c3-features`.
+- **C4 · Regime (опционально)** — ансамбль детекторов (ADX/Donchian/BOCPD/HMM). Пакет в исходниках, сборка в дистрибутив не включена.
 
-* **C1 · DataLayer.OHLCV** — импорт, нормализация, ресемплинг, идемпотентная запись Parquet, отчёты пропусков.
-* **C2 · DataQuality** — валидация, санитайз, сводные отчёты качества, флаги DQ на данных.
-* **C3 · Features.Core** — вычисление признаков из валидированных OHLCV; без внешних TA-зависимостей; pandas-only.
-
+---
 ## Требования
+- Python ≥ 3.9
+- `numpy`, `pandas`, `pyarrow`, `requests` (см. `pyproject.toml`)
 
-* Python 3.11+
-* pandas ≥ 2.2
-* Остальные зависимости — см. `pyproject.toml`
-
-## Установка
-
+Установка для разработки:
 ```bash
-python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -U pip
-pip install -e .[dev]
+pip install -e .[test]
 ```
-
-Переменные окружения (опционально): `BYBIT_API_KEY`, `BYBIT_API_SECRET`. Каталог данных: `C1_DATA_ROOT` или `./data` по умолчанию.
-
-## CLI (сводка)
-
-### C1/C2
-
-```bash
-# История 1m (UTC)
-python -m ohlcv.cli backfill --symbols BTCUSDT,ETHUSDT --since 2024-01-01 --category spot --spot-align-futures
-
-# Обновление хвоста до «текущее время - 1 бар»
-python -m ohlcv.cli update --symbols BTCUSDT,ETHUSDT --category spot
-
-# Ресемплинг 1m → 1h
-python -m ohlcv.cli resample --symbols BTCUSDT,ETHUSDT --from-tf 1m --to-tf 1h
-
-# Отчёт о пропусках
-python -m ohlcv.cli report-missing --symbols BTCUSDT,ETHUSDT --tf 1m --out ./reports/missing_1m.csv
-
-# DataQuality: валидация и выгрузка артефактов
-python -m ohlcv.cli quality-validate --symbols BTCUSDT,ETHUSDT --tf 1m --write \
-  --issues ./reports/issues.csv --issues-parquet ./reports/issues.parquet \
-  --quality-summary-csv ./reports/quality_summary.csv --quality-summary-json ./reports/quality_summary.json --truncate
-```
-
-### Формат данных
-
-Parquet per `(symbol, tf)`; обязательные колонки: `ts, o, h, l, c, v`; опционально: `t, is_gap, dq_flags, dq_notes`.
-Метаданные в `c1.meta` (JSON): `symbol, tf, generated_at, data_hash, schema`.
 
 ---
-
-## C3 · Features.Core
-
+## Быстрый старт
+### 1) Загрузка минутных данных (C1)
 ```bash
-# Пример: формирование признаков на минутных барах
-python -m ohlcv.features.cli build \
-  --input ./data/BTCUSDT/1m.parquet \
+c1-ohlcv backfill \
   --symbol BTCUSDT \
-  --tf 1m \
-  --config configs/features.example.yaml \
-  --output out/BTCUSDT_1m_features.parquet
+  --store ./data \
+  --since-ms 1700000000000 \
+  --until-ms 1700003600000
 ```
+Выход: `./data/BTCUSDT/1m.parquet` с метаданными `c1.meta` в footer.
 
-### Важное про `--tf` и частоту входа
-
-* Частота признаков определяется частотой **входного** файла.
-* Параметр `--tf` в `features.cli` — это **метка** в выходе (`tf`), а не механизм ресемплинга.
-* Для часовых признаков подай часовые бары. Ресемплинг выполняется **в C1** (`python -m ohlcv.cli resample`), а не в `features.cli`.
-
-Корректные последовательности:
-
+Догрузка хвоста:
 ```bash
-# 1) Минутные фичи из минутного входа
-python -m ohlcv.features.cli build --input data/SYM/1m.parquet --symbol SYM --tf 1m --output out/SYM_1m_features.parquet
-
-# 2) Часовые фичи: сначала ресемплинг 1m→1h, затем расчёт признаков на 1h
-python -m ohlcv.cli resample --symbols SYM --from-tf 1m --to-tf 1h --data-root ./data
-python -m ohlcv.features.cli build --input data/SYM/1h.parquet --symbol SYM --tf 1h --output out/SYM_1h_features.parquet
-
-# 3) Если указать --tf 1h на минутном входе — частота признаков останется минутной; изменится только метка tf в выходе
-python -m ohlcv.features.cli build --input data/SYM/1m.parquet --symbol SYM --tf 1h --output out/SYM_mislabel.parquet
-# Некорректное использование; не полагайся на такую сборку.
+c1-ohlcv update --symbol BTCUSDT --store ./data
 ```
 
-### Вход/выход
+Ресемплинг 1m→5m:
+```bash
+c1-ohlcv resample --symbol BTCUSDT --store ./data --dst-tf 5m
+```
 
-* Вход: CSV/Parquet из C2 с колонками `timestamp_ms,start_time_iso,open,high,low,close,volume,(turnover?)`; допускается внутренняя схема `o,h,l,c,v,(t?)` (автопереименование).
-* Выход: исходные поля + признаки `f_*`, а также `symbol`, `tf`, `f_valid_from`, `f_build_version`.
+Отчёт по пропускам (C2):
+```bash
+c1-ohlcv report-missing \
+  --symbol BTCUSDT --store ./data \
+  --since-ms 1700000000000 --until-ms 1700003600000 \
+  --fail-gap-pct 5
+```
+Код возврата `2` при превышении порога пропусков.
 
-### Набор признаков по умолчанию
-
-* Доходности/вола: `f_ret`, `f_logret`, `f_rv_{20,60}`
-* Свечные: `f_tr`, `f_atr_14`, ширина Дончиана
-* Тренд/моментум: EMA/SMA, `±DI/ADX`
-* Z-score: `f_z_close_{20,60}`
-* Объёмы: скользящие средние объёма
-* `f_valid_from = max(всех окон)` — позиция первой полной строки без NaN по всем `f_*`
+### 2) Построение признаков (C3)
+```bash
+c3-features build \
+  input.parquet \
+  features.parquet \
+  --symbol BTCUSDT --tf 5m \
+  --config configs/features.example.yaml
+```
+Выход содержит ключевые столбцы: `f_rv_*, f_adx_14, f_pdi_14, f_mdi_14, f_donch_width_pct_*, f_rsi_14, f_vwap_*`, свечные `%`‑метрики, `f_valid_from`, `f_build_version`.
 
 ---
-
-## Артефакты
-
-* Parquet: `data/{symbol}/{1m,5m,15m,1h}.parquet`
-* Журнал DQ: `reports/issues.{csv,parquet}`
-* Сводка качества: `reports/quality_summary.{csv,json}`
-* Отчёты пропусков: `reports/missing_{1m,5m,15m,1h}.csv`
-
 ## Структура репозитория
-
 ```
 ohlcv/
-  cli.py                # C1/C2: backfill/update/resample/report/quality-validate
-  core/                 # базовые операции над рядами (ресемплинг/валидации)
-  io/                   # parquet_store и I/O-утилиты
-  quality/              # валидатор данных (C2)
-  features/             # вычисление признаков и CLI (C3)
+  api/bybit.py            # клиент Bybit v5 (публичный), backoff+джиттер
+  cli.py                  # CLI: backfill, update, resample, read, report-missing
+  core/validate.py        # нормализация 1m, календарь, is_gap
+  core/resample.py        # агрегация 1m→{5m,15m,1h}
+  io/parquet_store.py     # Parquet: идемпотентная запись, метаданные c1.meta
+  io/tail_cache.py        # sidecar <symbol>/<tf>.latest.json
+  datareader.py           # DataReader для диапазонов и дней
+  utils/timeframes.py     # парсинг/выравнивание таймфреймов
+  version.py              # __version__, build_signature()
+
+ohlcv/features/
+  __init__.py, core.py, schema.py, cli.py, utils.py
+
+c4_regime/                # ансамбль детекторов (опционально)
+
 configs/
-  features.example.yaml # пример конфигурации C3
-tests/                  # юнит- и интеграционные тесты
-data/                   # корень данных по умолчанию (локально)
-reports/                # отчёты (issues, quality_summary, missing)
+  features.example.yaml   # пример конфигурации C3
+
+tests/
+  test_*.py               # юнит‑ и интеграционные тесты
 ```
 
-## CI
+---
+## Схемы данных
+### Паркет‑хранилище (C1)
+- Путь: `<root>/<symbol>/<tf>.parquet`
+- Индекс‑колонка: `ts` (tz‑aware, UTC, timestamp[ns])
+- Данные: `o,h,l,c,v` (float64), опционально `t` (turnover, float64), `is_gap` (bool)
+- Сжатие: `zstd(level=7)`; группировка: `row_group_size=256_000`; `use_dictionary=True`
+- Метаданные (footer, ключ `c1.meta`):
+  ```json
+  {
+    "symbol": "BTCUSDT",
+    "tf": "1m",
+    "rows": 123456,
+    "min_ts": "2024-01-01T00:00:00+00:00",
+    "max_ts": "2024-01-02T00:00:00+00:00",
+    "generated_at": "<UTC ISO>",
+    "data_hash": "<sha1>",
+    "build_signature": "C1-0.1.0+p<psha>+g<sha>[-dirty]",
+    "schema": ["ts","o","h","l","c","v","t","is_gap"],
+    "schema_version": 1,
+    "zstd_level": 7,
+    "row_group_size": 256000
+  }
+  ```
 
-`pytest -q --maxfail=1 --disable-warnings --cov=ohlcv --cov-report=term-missing`
+### Features (C3)
+- Вход: OHLCV с колонками `timestamp_ms,start_time_iso,open,high,low,close,volume` или паркет с индексом `ts`.
+- Выход: признаки по постановке C3. Прогрев `f_valid_from` = максимум окон.
+- Версионирование: `f_build_version = C3-<ver>+p<psha>(+g<sha>[-dirty])`.
 
-## Спецификации
+---
+## DataReader
+Высокоуровневое чтение диапазонов и суток:
+```python
+from ohlcv import DataReader
+r = DataReader("./data")
+# выборка с parquet‑filters
+df, st = r.read_range("BTCUSDT", "1m", start_ms=1700000000000, end_ms=1700003600000, columns=["o","c"]) 
+# выравнивание к минутному календарю + флаг is_gap
+aligned, st2 = r.read_range("BTCUSDT", "1m", start_ms=..., end_ms=..., align_1m=True)
+# сутки UTC
+day_df, _ = r.read_day_utc("BTCUSDT", "5m", "2024-01-01")
+```
+Sidecar‑кэш: `<root>/<symbol>/<tf>.latest.json` с полями `latest_ts_ms, rows_total, data_hash, updated_at`.
 
-* [C1 Data Layer](docs/specs/C1-Data%20Layer.pdf)
-* [C2 Data Quality](docs/specs/C2-Data%20Quality.pdf)
-* [C3 Features](docs/specs/C3-Features.pdf)
+---
+## CI/Качество (C2)
+- Проверка непрерывности минутных баров: `c1-ohlcv report-missing ... --fail-gap-pct <THRESHOLD>` → код `2` при превышении.
+- Инварианты: `high>=low`, `open/close ∈ [low,high]`. При `strict=True` нарушения вызывают ошибку.
+
+---
+## Примеры пайплайнов
+### От сырого 1m к признакам 5m
+```bash
+# 1) минутные бары
+c1-ohlcv backfill --symbol BTCUSDT --store ./data --since-ms $SINCE --until-ms $UNTIL
+# 2) ресемплинг 1m→5m
+c1-ohlcv resample --symbol BTCUSDT --store ./data --dst-tf 5m
+# 3) признаки 5m
+c3-features build ./data/BTCUSDT/5m.parquet ./data/BTCUSDT/features_5m.parquet --symbol BTCUSDT --tf 5m
+```
+
+---
+## Переменные окружения
+- `GIT_COMMIT` / `CI_COMMIT_SHA` / `SOURCE_VERSION` — используются для формирования `build_signature`.
+
+---
+## Тесты
+```bash
+pytest -q
+```
+
+---
+## Траблшутинг
+- `pyarrow` отсутствует → Parquet‑операции недоступны. Установить зависимость.
+- `ValueError: ожидался столбец 'ts'` при чтении — повреждён файл/неверный формат; перезаписать через `write_idempotent`.
+- Пустые ответы Bybit на свежем окне — возможная пауза/делист; повторить с меньшим интервалом.
+
+---
+## Версионирование
+- `ohlcv/version.py::__version__` — версия пакета.
+- `build_signature(params, component)` — сигнатура сборки: `C1-<ver>+p<psha>+g<sha>[-dirty]`.
+
+---
+## Лицензия
+Proprietary
