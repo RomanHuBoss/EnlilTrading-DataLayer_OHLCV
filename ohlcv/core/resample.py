@@ -1,104 +1,107 @@
 # ohlcv/core/resample.py
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# Разрешённые целевые таймфреймы
-_RULES: Dict[str, Tuple[str, int]] = {
-    "5m": ("5T", 5),
-    "15m": ("15T", 15),
-    "1h": ("1H", 60),
-}
+from .validate import normalize_ohlcv_1m, align_and_flag_gaps
+
+__all__ = ["resample_1m_to"]
 
 
-def _require_1m_index(df: pd.DataFrame) -> None:
-    if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
-        raise TypeError("ожидается tz-aware DatetimeIndex в UTC")
-    # Разрешаем пропуски, но шаг каждой строки должен быть ровно 1 минута относительно своего собственного таймстемпа
-    # То есть индекс должен быть минутным (секунды/милисекунды = 0)
-    if not (df.index.second == 0).all() or not (df.index.nanosecond == 0).all():
-        raise ValueError("индекс должен быть выровнен по минутам (секунды/нс = 0)")
+def _dst_freq(tf: str) -> Tuple[str, int]:
+    tf = tf.strip().lower()
+    if tf.endswith("m"):
+        n = int(tf[:-1])
+        return f"{n}T", n
+    if tf.endswith("h"):
+        n = int(tf[:-1])
+        return f"{n}H", 60 * n
+    raise ValueError(f"неподдерживаемый целевой tf: {tf}")
 
 
-def _has_col(df: pd.DataFrame, name: str) -> bool:
-    return name in df.columns
+def _to_right_label_ms(idx: pd.DatetimeIndex) -> pd.Series:
+    """Преобразует DatetimeIndex групп к правой границе в миллисекундах."""
+    return (idx.view("int64") // 1_000_000).astype("int64")
 
 
-def resample_1m_to(df1m: pd.DataFrame, dst_tf: str, *, allow_partial: bool = False) -> pd.DataFrame:
-    """Агрегирует минутные бары в {5m, 15m, 1h} с якорем по UTC-эпохе.
+def resample_1m_to(df_1m: pd.DataFrame, dst_tf: str) -> pd.DataFrame:
+    """Ресемплинг 1m → dst_tf (5m/15m/1h) по правой границе окна.
 
-    Вход: df1m с индексом ts (UTC) и колонками o/h/l/c/v (+t, +is_gap опционально).
-    Выход: агрегированный DataFrame с теми же колонками и колонкой is_gap, отражающей
-           наличие пропусков внутри окна (или поднятую из входного is_gap).
-
-    Правила агрегирования: open=first, high=max, low=min, close=last, volume=sum, t=sum, is_gap=max|incomplete.
-    Частичные окна в начале/хвосте по умолчанию удаляются (allow_partial=False).
+    Вход: DataFrame 1m со столбцами o,h,l,c,v[,t] и/или колонкой ts либо DatetimeIndex UTC.
+    Алгоритм:
+      1) normalize_ohlcv_1m → align_and_flag_gaps(strict=True) для полной минутной сетки и is_gap по минутам.
+      2) Группировка по dst_tf (правые границы).
+      3) Агрегаты: o=first, h=max, l=min, c=last, v=sum, t=sum; is_gap=any или недобор минут.
+      4) Вывод: ts=int64 (мс, правая граница), канонический порядок столбцов.
     """
-    if dst_tf not in _RULES:
-        raise ValueError(f"неподдерживаемый целевой таймфрейм: {dst_tf}")
-    rule, minutes = _RULES[dst_tf]
+    if df_1m is None or len(df_1m) == 0:
+        return pd.DataFrame(columns=["ts", "o", "h", "l", "c", "v", "t", "is_gap"]).astype({"ts": "int64"})
 
-    _require_1m_index(df1m)
+    # Шаг 1: нормализация и выравнивание минутной сетки
+    norm = normalize_ohlcv_1m(df_1m)
+    aligned, _stats = align_and_flag_gaps(norm, strict=True)
 
-    cols = [c for c in ("o", "h", "l", "c", "v", "t", "is_gap") if _has_col(df1m, c)]
-    df = df1m[cols].copy()
+    freq, nmin = _dst_freq(dst_tf)
 
-    # Булевы/числовые типы
-    if _has_col(df, "is_gap"):
-        df["is_gap"] = df["is_gap"].astype(bool)
+    # Группировка правыми границами
+    g = aligned.groupby(pd.Grouper(freq=freq, label="right", closed="right"))
 
-    # Группировка с якорем по эпохе
-    g = df.groupby(pd.Grouper(freq=rule, label="left", origin="epoch"))
+    out = pd.DataFrame(index=g.size().index)
 
-    # Подсчёт наличия валидного бара внутри окна (все OHLC не NaN)
-    present = (~df[[c for c in ["o", "h", "l", "c"] if c in df.columns]].isna().any(axis=1))
-    present_count = present.groupby(pd.Grouper(freq=rule, label="left", origin="epoch")).sum(min_count=1)
+    # Агрегаты OHLCV
+    out["o"] = g["o"].first()
+    out["h"] = g["h"].max()
+    out["l"] = g["l"].min()
+    out["c"] = g["c"].last()
+    out["v"] = g["v"].sum()
+    if "t" in aligned.columns:
+        out["t"] = g["t"].sum()
 
-    agg_map = {}
-    if _has_col(df, "o"): agg_map["o"] = "first"
-    if _has_col(df, "h"): agg_map["h"] = "max"
-    if _has_col(df, "l"): agg_map["l"] = "min"
-    if _has_col(df, "c"): agg_map["c"] = "last"
-    if _has_col(df, "v"): agg_map["v"] = "sum"
-    if _has_col(df, "t"): agg_map["t"] = "sum"
-    if _has_col(df, "is_gap"): agg_map["is_gap"] = "max"
+    # is_gap окна: если любая минута внутри окна is_gap=True ИЛИ окно неполное по числу минут
+    # (неполные окна возникают на краях диапазона или при дырках до выравнивания; последние уже помечены минутными is_gap)
+    any_gap = g["is_gap"].any()
 
-    out = g.agg(agg_map)
+    # число минут в каждом окне
+    cnt = g.size().rename("count").astype("int64")
+    out["is_gap"] = any_gap.reindex(out.index).fillna(False).astype(bool)
+    out.loc[cnt < nmin, "is_gap"] = True
 
-    # Компактная проверка пустоты
-    if out.empty:
-        # возвращаем пустой фрейм с ожидаемыми колонками в правильном порядке
-        want = [c for c in ["o", "h", "l", "c", "v", "t", "is_gap"] if c in agg_map]
-        return pd.DataFrame(columns=want, index=out.index).astype({c: out.dtypes.get(c, "float64") for c in want})
+    # Индекс → ts (правая граница окна)
+    out_ts = _to_right_label_ms(out.index)
+    out = out.reset_index(drop=True)
+    out.insert(0, "ts", out_ts.values)
 
-    # Вычисление флага неполного окна
-    expected = minutes  # количество минут в окне
-    incomplete = (present_count.fillna(0).astype(int) < expected)
+    # Типы
+    for c in ["o", "h", "l", "c", "v"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
+    if "t" in out.columns:
+        out["t"] = pd.to_numeric(out["t"], errors="coerce").astype("float64")
+    out["is_gap"] = out["is_gap"].astype(bool)
+    out["ts"] = out["ts"].astype("int64")
 
-    # Признак gap: максимум входных флагов или неполное окно
-    if _has_col(out, "is_gap"):
-        out["is_gap"] = out["is_gap"].astype(bool) | incomplete.reindex(out.index, fill_value=False).astype(bool)
-    else:
-        out["is_gap"] = incomplete.reindex(out.index, fill_value=False).astype(bool)
+    # Канонический порядок
+    cols = ["ts", "o", "h", "l", "c", "v"]
+    if "t" in out.columns:
+        cols.append("t")
+    cols.append("is_gap")
+    out = out[cols]
 
-    # Удаление частичных окон на краях, если запрещено
-    if not allow_partial and len(out) > 0:
-        mask_full = ~out["is_gap"].astype(bool)
-        # Крайние неполные окна часто только на границах; удаляем первую/последнюю, если они неполные
-        if not mask_full.iloc[0]:
-            out = out.iloc[1:]
-            mask_full = mask_full.iloc[1:]
-        if len(out) > 0 and not mask_full.iloc[-1]:
-            out = out.iloc[:-1]
+    # Удалить полностью пустые окна (в теории не встречаются после strict=True, оставлено на всякий случай)
+    empty_mask = out[[c for c in ["o", "h", "l", "c"]]].isna().all(axis=1)
+    if empty_mask.any():
+        # Синтетика: o=h=l=c=prev_close, v=0, is_gap=True
+        prev_c = out["c"].ffill()
+        for c in ["o", "h", "l", "c"]:
+            out.loc[empty_mask, c] = prev_c.loc[empty_mask]
+        out.loc[empty_mask, "v"] = 0.0
+        if "t" in out.columns:
+            out.loc[empty_mask, "t"] = 0.0
+        out.loc[empty_mask, "is_gap"] = True
 
-    # Приведение типов и имя индекса
-    out.index = pd.DatetimeIndex(out.index, tz="UTC", name="ts")
-
-    # Порядок столбцов
-    order = [c for c in ["o", "h", "l", "c", "v", "t", "is_gap"] if c in out.columns]
-    out = out[order]
+    # Финальная сортировка по ts, дедуп по ts
+    out = out.sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
 
     return out

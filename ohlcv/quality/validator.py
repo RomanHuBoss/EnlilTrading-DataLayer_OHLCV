@@ -6,551 +6,388 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# =============================
-# Битовая маска dq_flags + синонимы для обратной совместимости
-# =============================
-DQ_BITS: Dict[str, int] = {
-    # Базовые
-    "INV_OHLC": 0,
-    "inv_ohlc": 0,
-    "MISSING_BARS": 1,
-    "gap": 1,
-    "MISSING": 1,  # совместимость с тестами/наследием
-    "missing": 1,
-    "NEG_V": 2,
-    "neg_v": 2,
-    "MISALIGNED_TS": 3,
-    "misaligned_ts": 3,
-    "MISSING_FILLED": 4,
-    "missing_filled": 4,
-    # Новые для C2
-    "R20_VOL_SPIKE": 5,
-    "R21_ATR_SPIKE": 6,
-    "R22_RET_SPIKE": 7,
-    "R30_OHLC_MISMATCH": 8,
-    "R31_VOL_MISMATCH": 9,
-    "R33_COUNT_MISMATCH": 10,
-}
+from .issues import normalize_issues_df
 
-BIT_INV_OHLC = DQ_BITS["INV_OHLC"]
-BIT_GAP = DQ_BITS["MISSING_BARS"]
-BIT_NEG_V = DQ_BITS["NEG_V"]
-BIT_MISALIGNED = DQ_BITS["MISALIGNED_TS"]
-BIT_MISSING_FILL = DQ_BITS["MISSING_FILLED"]
-BIT_R20 = DQ_BITS["R20_VOL_SPIKE"]
-BIT_R21 = DQ_BITS["R21_ATR_SPIKE"]
-BIT_R22 = DQ_BITS["R22_RET_SPIKE"]
-BIT_R30 = DQ_BITS["R30_OHLC_MISMATCH"]
-BIT_R31 = DQ_BITS["R31_VOL_MISMATCH"]
-BIT_R33 = DQ_BITS["R33_COUNT_MISMATCH"]
-
-FLAG_TO_NOTE: Dict[int, str] = {
-    BIT_INV_OHLC: "inv_ohlc",
-    BIT_GAP: "gap",
-    BIT_NEG_V: "neg_v",
-    BIT_MISALIGNED: "misaligned_ts",
-    BIT_MISSING_FILL: "missing_filled",
-    BIT_R20: "vol_spike",
-    BIT_R21: "atr_spike",
-    BIT_R22: "ret_spike",
-    BIT_R30: "agg_ohlc_mismatch",
-    BIT_R31: "agg_vol_mismatch",
-    BIT_R33: "agg_count_mismatch",
-}
+__all__ = [
+    "QualityConfig",
+    "validate",
+]
 
 # =============================
 # Конфигурация
 # =============================
 @dataclass
 class QualityConfig:
-    # Порог доли пропусков для автозаполнения внутренних минут (только 1m)
-    missing_fill_threshold: float = 0.0001
-    # Допустимое отклонение (секунд) до правой границы минуты
+    # Базовые допуски
     misaligned_tolerance_seconds: int = 1
-    # Окна и пороги статистических правил R20–R22
-    atr_window: int = 14
+    epsilon_rel: float = 1e-6  # допуск при сравнении чисел
+    # Окна/пороги статистических правил
     vol_window: int = 50
+    atr_window: int = 14
     ret_window: int = 50
-    # Метод и пороги: z-score или квантили
-    use_zscore: bool = True
     z_thr_vol: float = 6.0
-    z_thr_atr: float = 5.0
-    z_thr_ret: float = 6.0
-    q_hi_vol: float = 0.999
-    q_hi_atr: float = 0.995
-    q_hi_ret: float = 0.999
-    # Минимально необходимая история для расчётов
-    min_hist: int = 200
-    # Допуск сравнения при сверке агрегатов
-    compare_rtol: float = 1e-9
-    compare_atol: float = 1e-8
-
+    z_thr_atr: float = 6.0
+    z_thr_ret: float = 8.0
 
 # =============================
-# Утилиты индекса/времени
+# Вспомогательные
 # =============================
+_DEF_COLS = ["o", "h", "l", "c", "v", "t", "is_gap"]
 
-def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise ValueError("ожидается DatetimeIndex")
-    idx = df.index
-    if idx.tz is None:
-        idx = idx.tz_localize("UTC")
-    else:
-        idx = idx.tz_convert("UTC")
+
+def _ensure_ts(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out.index = idx
-    out = out.sort_index()
+    if "ts" not in out.columns:
+        if isinstance(out.index, pd.DatetimeIndex):
+            out["ts"] = (out.index.view("int64") // 1_000_000).astype("int64")
+        else:
+            raise ValueError("ожидался столбец 'ts' или DatetimeIndex")
+    out["ts"] = pd.to_numeric(out["ts"], errors="coerce").astype("int64")
+    for c in ["o", "h", "l", "c", "v", "t"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
+    if "is_gap" in out.columns:
+        out["is_gap"] = out["is_gap"].astype(bool)
+    # сортировка + дедуп (последний выигрывает)
+    out = out.sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
     return out
 
 
-def _align_to_right_boundary(
-    df: pd.DataFrame, *, tf: str, tol_sec: int
-) -> Tuple[pd.DataFrame, np.ndarray]:
-    if df.empty or tf != "1m":
-        return df, np.zeros(len(df), dtype=bool)
-    right = df.index.ceil("min")
-    delta_i8 = right.view("i8") - df.index.view("i8")
-    need = np.abs(delta_i8 // 1_000_000_000) > tol_sec
-    if not need.any():
-        return df, need
-    new_i8 = np.where(need, right.view("i8"), df.index.view("i8"))
-    out = df.copy()
-    out.index = pd.DatetimeIndex(new_i8.astype("datetime64[ns]")).tz_localize("UTC")
-    out = out[~out.index.duplicated(keep="last")].sort_index()
-    return out, need
+def _tf_ms(tf: str) -> int:
+    tf = tf.strip().lower()
+    if tf.endswith("m"):
+        return int(tf[:-1]) * 60_000
+    if tf.endswith("h"):
+        return int(tf[:-1]) * 60 * 60_000
+    raise ValueError(f"неподдерживаемый tf: {tf}")
 
 
-def _fill_small_internal_gaps(
-    df: pd.DataFrame, *, threshold: float
-) -> Tuple[pd.DataFrame, np.ndarray]:
-    """Заполнение внутренних минут при малой доле пропусков.
-    Возвращает (df_на_полном_календаре, mask_is_gap).
-    """
-    if df.empty:
-        return df, np.zeros(0, dtype=bool)
-    start, end = df.index.min(), df.index.max()
-    full = pd.date_range(start, end, freq="min", tz="UTC")
-    if len(full) == len(df):
-        out = df.copy()
-        if "is_gap" not in out.columns:
-            out["is_gap"] = False
-        return out, out["is_gap"].to_numpy(dtype=bool)
+def _to_pandas_freq(tf: str) -> str:
+    tf = tf.strip().lower()
+    if tf.endswith("m"):
+        return f"{int(tf[:-1])}T"
+    if tf.endswith("h"):
+        return f"{int(tf[:-1])}H"
+    raise ValueError(f"неподдерживаемый tf: {tf}")
 
-    miss_rate = 1.0 - (len(df) / len(full))
-    if miss_rate > threshold:
-        out = df.copy()
-        if "is_gap" not in out.columns:
-            out["is_gap"] = False
-        return out, out["is_gap"].to_numpy(dtype=bool)
 
-    cols = [c for c in ["o", "h", "l", "c", "v", "t"] if c in df.columns]
-    base = df[cols].reindex(full)
-    prev_c = base["c"].ffill()
-    syn = base[base["o"].isna()].copy()
-    if not syn.empty:
-        syn["o"] = prev_c.loc[syn.index]
-        syn["h"] = prev_c.loc[syn.index]
-        syn["l"] = prev_c.loc[syn.index]
-        syn["c"] = prev_c.loc[syn.index]
-        if "v" in syn.columns:
-            syn["v"] = 0.0
-        if "t" in syn.columns:
-            syn["t"] = 0.0
-        base.update(syn)
-    base["is_gap"] = False
-    base.loc[syn.index, "is_gap"] = True
-    return base, base["is_gap"].to_numpy(dtype=bool)
+def _prev_close_series(df: pd.DataFrame) -> pd.Series:
+    c = df["c"] if "c" in df.columns else pd.Series(np.nan, index=df.index)
+    return c.shift(1).fillna(c)
 
+
+def _append_issue(issues: List[Dict[str, Any]], ts: int, code: str, note: str | None = None) -> None:
+    issues.append({"ts": int(ts), "code": code, "note": note})
+
+
+def _rel_ne(a: pd.Series, b: pd.Series, eps: float) -> pd.Series:
+    # относительное сравнение с допуском
+    den = np.maximum(1.0, np.maximum(np.abs(a), np.abs(b)))
+    return (np.abs(a - b) / den) > eps
 
 # =============================
-# Правки/правила на уровне одного ТФ
+# Правила C2 (базовые)
 # =============================
 
-def _apply_rules_basic(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[Dict[str, Any]], np.ndarray]:
-    out = df.copy()
-    n = len(out)
-    flags = np.zeros(n, dtype=np.int32)
-    issues: List[Dict[str, Any]] = []
+def _rule_R01_DUP_TS(df: pd.DataFrame, issues: List[Dict[str, Any]]) -> pd.DataFrame:
+    dup = df["ts"].duplicated(keep="last")
+    if dup.any():
+        for ts in df.loc[dup, "ts"].tolist():
+            _append_issue(issues, ts, "R01_DUP_TS")
+        df = df.loc[~dup].copy()
+    return df
 
-    # R12: отрицательный объём → 0
-    if "v" in out.columns:
-        neg = out["v"].to_numpy() < 0.0
-        if neg.any():
-            out.loc[out.index[neg], "v"] = 0.0
-            flags[neg] |= 1 << BIT_NEG_V
-            for ts in out.index[neg]:
-                issues.append({
-                    "ts": ts,
-                    "code": "NEG_V",
-                    "note": "negative volume -> 0",
-                    "severity": "medium",
-                    "action": "clip_to_zero",
-                    "dq_rank": 30,
-                })
 
-    # R10–R11: инварианты OHLC
-    o_arr = out["o"].to_numpy()
-    h_arr = out["h"].to_numpy()
-    l_arr = out["l"].to_numpy()
-    c_arr = out["c"].to_numpy()
-    inv = (h_arr < np.maximum(o_arr, c_arr)) | (l_arr > np.minimum(o_arr, c_arr))
-    if inv.any():
-        h_fix = np.maximum(h_arr, np.maximum(o_arr, c_arr))
-        l_fix = np.minimum(l_arr, np.minimum(o_arr, c_arr))
-        out.loc[out.index[inv], "h"] = h_fix[inv]
-        out.loc[out.index[inv], "l"] = l_fix[inv]
-        flags[inv] |= 1 << BIT_INV_OHLC
-        for ts in out.index[inv]:
-            issues.append({
-                "ts": ts,
-                "code": "INV_OHLC",
-                "note": "OHLC invariant fixed",
-                "severity": "high",
-                "action": "fix_bounds",
-                "dq_rank": 40,
-            })
+def _rule_R02_TS_FUTURE(df: pd.DataFrame, tf_ms: int, issues: List[Dict[str, Any]]) -> pd.DataFrame:
+    now_ms = int(pd.Timestamp.utcnow().tz_localize("UTC").value // 1_000_000)
+    mask = df["ts"] > (now_ms - tf_ms)
+    if mask.any():
+        for ts in df.loc[mask, "ts"].tolist():
+            _append_issue(issues, ts, "R02_TS_FUTURE")
+        df = df.loc[~mask].copy()
+    return df
 
-    return out, issues, flags
 
+def _rule_R03_TS_MISALIGNED(df: pd.DataFrame, tf_ms: int, tol_s: int, issues: List[Dict[str, Any]]) -> pd.DataFrame:
+    off = (df["ts"] % tf_ms).astype("int64")
+    mis = off != 0
+    if not mis.any():
+        return df
+    near = (off <= tol_s * 1000) | ((tf_ms - off) <= tol_s * 1000)
+    fixable = mis & near
+    hard = mis & (~near)
+    if fixable.any():
+        fixed = ((df.loc[fixable, "ts"] // tf_ms) * tf_ms).astype("int64")
+        df.loc[fixable, "ts"] = fixed
+        for ts in fixed.tolist():
+            _append_issue(issues, int(ts), "R03_TS_MISALIGNED", note="rounded")
+    if hard.any():
+        for ts in df.loc[hard, "ts"].tolist():
+            _append_issue(issues, int(ts), "R03_TS_MISALIGNED", note="dropped")
+        df = df.loc[~hard].copy()
+    return df.sort_values("ts").reset_index(drop=True)
+
+
+def _gapify_mask(df: pd.DataFrame, mask: pd.Series, issues: List[Dict[str, Any]], code: str) -> None:
+    if not mask.any():
+        return
+    prev = _prev_close_series(df)
+    for col in ["o", "h", "l", "c"]:
+        if col in df.columns:
+            df.loc[mask, col] = prev.loc[mask]
+    if "v" in df.columns:
+        df.loc[mask, "v"] = 0.0
+    if "t" in df.columns:
+        df.loc[mask, "t"] = 0.0
+    if "is_gap" in df.columns:
+        df.loc[mask, "is_gap"] = True
+    else:
+        df["is_gap"] = False
+        df.loc[mask, "is_gap"] = True
+    for ts in df.loc[mask, "ts"].tolist():
+        _append_issue(issues, int(ts), code)
+
+
+def _rule_R10_NEG_PRICE(df: pd.DataFrame, issues: List[Dict[str, Any]]) -> pd.DataFrame:
+    need = {"o", "h", "l", "c"}
+    if not need.issubset(df.columns):
+        return df
+    bad = (df[["o", "h", "l", "c"]] <= 0).any(axis=1)
+    _gapify_mask(df, bad, issues, code="R10_NEG_PRICE")
+    return df
+
+
+def _rule_R11_NEG_VOL(df: pd.DataFrame, issues: List[Dict[str, Any]]) -> pd.DataFrame:
+    if "v" not in df.columns:
+        return df
+    bad = df["v"] < 0
+    if bad.any():
+        df.loc[bad, "v"] = 0.0
+        for ts in df.loc[bad, "ts"].tolist():
+            _append_issue(issues, int(ts), "R11_NEG_VOL")
+    return df
+
+
+def _rule_R12_NAN(df: pd.DataFrame, issues: List[Dict[str, Any]]) -> pd.DataFrame:
+    need = {"o", "h", "l", "c"}
+    if not need.issubset(df.columns):
+        return df
+    bad = df[["o", "h", "l", "c"]].isna().any(axis=1)
+    _gapify_mask(df, bad, issues, code="R12_NAN")
+    return df
+
+
+def _rule_R13_OHLC_ORDER(df: pd.DataFrame, issues: List[Dict[str, Any]]) -> pd.DataFrame:
+    need = {"o", "h", "l", "c"}
+    if not need.issubset(df.columns):
+        return df
+    mx = pd.concat([df.get("h"), df.get("o"), df.get("c")], axis=1).max(axis=1)
+    mn = pd.concat([df.get("l"), df.get("o"), df.get("c")], axis=1).min(axis=1)
+    bad = (df["h"] < mx) | (df["l"] > mn)
+    if bad.any():
+        df.loc[bad, "h"] = mx.loc[bad]
+        df.loc[bad, "l"] = mn.loc[bad]
+        eq = bad & (df["h"] == df["l"])
+        _gapify_mask(df, eq, issues, code="R13_OHLC_ORDER")
+        rest = bad & (~eq)
+        for ts in df.loc[rest, "ts"].tolist():
+            _append_issue(issues, int(ts), "R13_OHLC_ORDER")
+    return df
+
+
+def _rule_R14_H_LT_L(df: pd.DataFrame, issues: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not {"h", "l"}.issubset(df.columns):
+        return df
+    bad = df["h"] < df["l"]
+    if bad.any():
+        tmp = df.loc[bad, "h"].copy()
+        df.loc[bad, "h"] = df.loc[bad, "l"]
+        df.loc[bad, "l"] = tmp
+        for ts in df.loc[bad, "ts"].tolist():
+            _append_issue(issues, int(ts), "R14_H_LT_L")
+    return df
 
 # =============================
-# Статистика: TR/ATR, доходности, Z-score/квантили
+# Статистические правила R20–R22
 # =============================
 
-def _true_range(o: np.ndarray, h: np.ndarray, l: np.ndarray, c: np.ndarray) -> np.ndarray:
-    prev_c = np.roll(c, 1)
-    prev_c[0] = c[0]
-    tr1 = h - l
-    tr2 = np.abs(h - prev_c)
-    tr3 = np.abs(l - prev_c)
-    return np.maximum(tr1, np.maximum(tr2, tr3))
+def _safe_log(x: pd.Series) -> pd.Series:
+    return np.log(x.clip(lower=1e-12))
 
 
 def _rolling_z(x: pd.Series, win: int) -> pd.Series:
-    m = x.rolling(win, min_periods=win).mean()
-    s = x.rolling(win, min_periods=win).std(ddof=0)
-    return (x - m) / s
+    mu = x.rolling(win, min_periods=max(5, win//5)).mean()
+    sd = x.rolling(win, min_periods=max(5, win//5)).std(ddof=1)
+    return (x - mu) / sd.replace(0.0, np.nan)
 
 
-def _flag_spikes(
-    df: pd.DataFrame,
-    *,
-    cfg: QualityConfig,
-) -> Tuple[List[Dict[str, Any]], np.ndarray]:
-    n = len(df)
-    flags = np.zeros(n, dtype=np.int32)
-    issues: List[Dict[str, Any]] = []
+def _rule_R20_VOL_SPIKE(df: pd.DataFrame, issues: List[Dict[str, Any]], win: int, z_thr: float) -> None:
+    if "v" not in df.columns:
+        return
+    z = _rolling_z(df["v"].fillna(0.0), win)
+    mask = z.abs() > z_thr
+    for ts in df.loc[mask, "ts"].tolist():
+        _append_issue(issues, int(ts), "R20_VOL_SPIKE")
 
-    if n < cfg.min_hist:
-        return issues, flags
 
-    # Доходности
-    ret = df["c"].pct_change().replace([np.inf, -np.inf], np.nan)
+def _atr_series(df: pd.DataFrame) -> pd.Series:
+    # классический ATR на основе TR
+    if not {"h", "l", "c"}.issubset(df.columns):
+        return pd.Series(np.nan, index=df.index)
+    h, l, c = df["h"], df["l"], df["c"].shift(1)
+    tr = pd.concat([(h - l).abs(), (h - c).abs(), (l - c).abs()], axis=1).max(axis=1)
+    return tr
 
-    # ATR
-    tr = pd.Series(_true_range(df["o"].to_numpy(), df["h"].to_numpy(), df["l"].to_numpy(), df["c"].to_numpy()), index=df.index)
-    atr = tr.rolling(cfg.atr_window, min_periods=cfg.atr_window).mean()
 
-    # Объём
-    vol = df["v"] if "v" in df.columns else pd.Series(np.nan, index=df.index)
+def _rule_R21_ATR_SPIKE(df: pd.DataFrame, issues: List[Dict[str, Any]], win: int, z_thr: float) -> None:
+    tr = _atr_series(df)
+    z = _rolling_z(tr.fillna(0.0), win)
+    mask = z.abs() > z_thr
+    for ts in df.loc[mask, "ts"].tolist():
+        _append_issue(issues, int(ts), "R21_ATR_SPIKE")
 
-    # Z-score / квантили
-    if cfg.use_zscore:
-        z_ret = _rolling_z(ret.abs(), cfg.ret_window)
-        z_atr = _rolling_z(atr, cfg.vol_window)
-        z_vol = _rolling_z(vol, cfg.vol_window)
 
-        m_ret = z_ret > cfg.z_thr_ret
-        m_atr = z_atr > cfg.z_thr_atr
-        m_vol = z_vol > cfg.z_thr_vol
-    else:
-        q_ret = ret.abs().rolling(cfg.ret_window, min_periods=cfg.ret_window).quantile(cfg.q_hi_ret)
-        q_atr = atr.rolling(cfg.vol_window, min_periods=cfg.vol_window).quantile(cfg.q_hi_atr)
-        q_vol = vol.rolling(cfg.vol_window, min_periods=cfg.vol_window).quantile(cfg.q_hi_vol)
-        m_ret = ret.abs() > q_ret
-        m_atr = atr > q_atr
-        m_vol = vol > q_vol
-
-    # Проставление флагов и issues
-    if m_vol.any():
-        idx = df.index[m_vol.fillna(False)]
-        flags[m_vol.fillna(False).to_numpy()] |= 1 << BIT_R20
-        for ts in idx:
-            issues.append({
-                "ts": ts,
-                "code": "R20_VOL_SPIKE",
-                "note": "volume spike",
-                "severity": "low",
-                "action": "flag",
-                "dq_rank": 10,
-            })
-
-    if m_atr.any():
-        idx = df.index[m_atr.fillna(False)]
-        flags[m_atr.fillna(False).to_numpy()] |= 1 << BIT_R21
-        for ts in idx:
-            issues.append({
-                "ts": ts,
-                "code": "R21_ATR_SPIKE",
-                "note": "atr spike",
-                "severity": "medium",
-                "action": "flag",
-                "dq_rank": 20,
-            })
-
-    if m_ret.any():
-        idx = df.index[m_ret.fillna(False)]
-        flags[m_ret.fillna(False).to_numpy()] |= 1 << BIT_R22
-        for ts in idx:
-            issues.append({
-                "ts": ts,
-                "code": "R22_RET_SPIKE",
-                "note": "return spike",
-                "severity": "medium",
-                "action": "flag",
-                "dq_rank": 20,
-            })
-
-    return issues, flags
-
+def _rule_R22_RET_SPIKE(df: pd.DataFrame, issues: List[Dict[str, Any]], win: int, z_thr: float) -> None:
+    if "c" not in df.columns:
+        return
+    r = _safe_log(df["c"]).diff()
+    z = _rolling_z(r.fillna(0.0), win)
+    mask = z.abs() > z_thr
+    for ts in df.loc[mask, "ts"].tolist():
+        _append_issue(issues, int(ts), "R22_RET_SPIKE")
 
 # =============================
-# Сверка согласованности агрегатов R30–R33
+# Согласованность ресемплинга R30–R33 (при наличии ref_1m и tf != '1m')
 # =============================
 
-def _resample_1m_to(df_1m: pd.DataFrame, dst_tf: str) -> pd.DataFrame:
-    if df_1m.empty:
-        return df_1m.copy()
-    rule = {"5m": "5min", "15m": "15min", "1h": "1h"}.get(dst_tf)
-    if rule is None:
-        raise ValueError("dst_tf должен быть в {5m,15m,1h}")
-
-    grp = df_1m.resample(rule, label="right", closed="right")
-    o = grp["o"].first()
-    h = grp["h"].max()
-    l = grp["l"].min()
-    c = grp["c"].last()
-    v = grp["v"].sum() if "v" in df_1m.columns else None
-
-    out = pd.concat([o.rename("o"), h.rename("h"), l.rename("l"), c.rename("c")], axis=1)
-    if v is not None:
-        out["v"] = v
-    return out.dropna(how="all")
-
-
-def _compare_frames(a: pd.DataFrame, b: pd.DataFrame, *, rtol: float, atol: float) -> Tuple[pd.Index, pd.Index]:
-    common = a.index.intersection(b.index)
-    if len(common) == 0:
-        return pd.Index([]), pd.Index([])
-    a1, b1 = a.loc[common], b.loc[common]
-    cols = [c for c in ["o", "h", "l", "c"] if c in a1.columns and c in b1.columns]
-    bad_rows_mask = np.zeros(len(common), dtype=bool)
-    if cols:
-        diff = [~np.isclose(a1[c].to_numpy(), b1[c].to_numpy(), rtol=rtol, atol=atol) for c in cols]
-        bad_rows_mask |= np.any(np.vstack(diff), axis=0)
-    if "v" in a1.columns and "v" in b1.columns:
-        bad_v = ~np.isclose((a1["v"].to_numpy()), (b1["v"].to_numpy()), rtol=rtol, atol=atol)
-        bad_rows_mask |= bad_v
-    bad_idx = common[bad_rows_mask]
-
-    # Проверка количества баров
-    count_bad = pd.Index([])
-    if len(a.index) != len(b.index):
-        # Найдём индексы, которых не хватает в b
-        miss = a.index.difference(b.index)
-        if len(miss) > 0:
-            count_bad = miss
-    return bad_idx, count_bad
+def _resample_1m(df1m: pd.DataFrame, tf: str) -> pd.DataFrame:
+    # индекс ts msec → DatetimeIndex UTC
+    ts = pd.to_datetime(df1m["ts"], unit="ms", utc=True)
+    core = df1m.set_index(ts)
+    freq = _to_pandas_freq(tf)
+    g = core.groupby(pd.Grouper(freq=freq, label="right"))
+    out = pd.DataFrame(index=g.size().index)
+    if "o" in core.columns:
+        out["o"] = g["o"].first()
+    if "h" in core.columns:
+        out["h"] = g["h"].max()
+    if "l" in core.columns:
+        out["l"] = g["l"].min()
+    if "c" in core.columns:
+        out["c"] = g["c"].last()
+    if "v" in core.columns:
+        out["v"] = g["v"].sum()
+    if "t" in core.columns:
+        out["t"] = g["t"].sum()
+    out.index = (out.index.view("int64") // 1_000_000).astype("int64")  # правые границы
+    out = out.reset_index().rename(columns={"index": "ts"})
+    return out.dropna(how="all").reset_index(drop=True)
 
 
-def _consistency_checks(
-    df: pd.DataFrame,
-    *,
+def _rule_R30_R31_R32_R33(
+    df_tf: pd.DataFrame,
+    ref_1m: pd.DataFrame,
     tf: str,
-    ref_1m: Optional[pd.DataFrame],
-    cfg: QualityConfig,
-) -> Tuple[List[Dict[str, Any]], np.ndarray]:
-    issues: List[Dict[str, Any]] = []
-    flags = np.zeros(len(df), dtype=np.int32)
+    issues: List[Dict[str, Any]],
+    eps: float,
+) -> None:
+    # Аггрегируем 1m до tf и сравниваем
+    agg = _resample_1m(ref_1m, tf)
+    # левое соединение по ts
+    on = sorted(set(["ts"]) | set([c for c in ["o","h","l","c","v","t"] if c in df_tf.columns and c in agg.columns]))
+    j = pd.merge(df_tf[on], agg[on], on="ts", how="left", suffixes=("", "_ref"))
 
-    if tf not in {"5m", "15m", "1h"}:
-        return issues, flags
-    if ref_1m is None or ref_1m.empty:
-        return issues, flags
+    def _cmp(col: str, code: str) -> None:
+        if col not in j.columns or f"{col}_ref" not in j.columns:
+            return
+        bad = _rel_ne(j[col].astype(float), j[f"{col}_ref"].astype(float), eps)
+        for ts in j.loc[bad, "ts"].tolist():
+            _append_issue(issues, int(ts), code)
 
-    a = df[[c for c in ["o", "h", "l", "c", "v"] if c in df.columns]].copy()
-    b = _resample_1m_to(ref_1m[[c for c in ["o", "h", "l", "c", "v"] if c in ref_1m.columns]], tf)
+    _cmp("o", "R30_OHLC_MISMATCH")
+    _cmp("h", "R30_OHLC_MISMATCH")
+    _cmp("l", "R30_OHLC_MISMATCH")
+    _cmp("c", "R30_OHLC_MISMATCH")
+    _cmp("v", "R31_VOL_MISMATCH")
 
-    bad, count_bad = _compare_frames(a, b, rtol=cfg.compare_rtol, atol=cfg.compare_atol)
+    # R32: High/Low вне диапазона минут
+    if {"h","l"}.issubset(j.columns) and {"h_ref","l_ref"}.issubset(j.columns):
+        bad_hi = j["h"] > (j["h_ref"] + np.maximum(1.0, np.abs(j["h_ref"])) * eps)
+        bad_lo = j["l"] < (j["l_ref"] - np.maximum(1.0, np.abs(j["l_ref"])) * eps)
+        for ts in j.loc[bad_hi | bad_lo, "ts"].tolist():
+            _append_issue(issues, int(ts), "R32_RANGE_MISMATCH")
 
-    if len(bad) > 0:
-        mask = df.index.isin(bad)
-        flags[mask] |= 1 << BIT_R30
-        for ts in bad:
-            issues.append({
-                "ts": ts,
-                "code": "R30_OHLC_MISMATCH",
-                "note": "aggregated OHLC/V differs from 1m resample",
-                "severity": "high",
-                "action": "rebuild_from_1m",
-                "dq_rank": 90,
-            })
-
-    if len(count_bad) > 0:
-        mask = df.index.isin(count_bad)
-        flags[mask] |= 1 << BIT_R33
-        for ts in count_bad:
-            issues.append({
-                "ts": ts,
-                "code": "R33_COUNT_MISMATCH",
-                "note": "missing aggregated bar vs 1m calendar",
-                "severity": "high",
-                "action": "reindex_and_fill",
-                "dq_rank": 80,
-            })
-
-    # Дополнительно: только по объёму (если OHLC совпали, а v — нет)
-    if not a.empty and "v" in a.columns and "v" in b.columns:
-        common = a.index.intersection(b.index)
-        if len(common):
-            v_bad = ~np.isclose(a.loc[common, "v"].to_numpy(), b.loc[common, "v"].to_numpy(), rtol=cfg.compare_rtol, atol=cfg.compare_atol)
-            if v_bad.any():
-                ts_bad = common[v_bad]
-                mask = df.index.isin(ts_bad)
-                flags[mask] |= 1 << BIT_R31
-                for ts in ts_bad:
-                    issues.append({
-                        "ts": ts,
-                        "code": "R31_VOL_MISMATCH",
-                        "note": "aggregated volume differs from 1m sum",
-                        "severity": "medium",
-                        "action": "rebuild_from_1m",
-                        "dq_rank": 70,
-                    })
-    return issues, flags
-
+    # R33: число минут в окне
+    nmin = _tf_ms(tf) // 60_000
+    cnt = (
+        ref_1m.assign(_ones=1)
+        .groupby(pd.to_datetime(ref_1m["ts"], unit="ms", utc=True).dt.floor(_to_pandas_freq(tf)) + pd.to_timedelta(nmin, unit="m"))
+        ["_ones"].sum()
+    )
+    cnt.index = (cnt.index.view("int64") // 1_000_000).astype("int64")
+    j2 = pd.merge(df_tf[["ts"]], cnt.rename("count").reset_index().rename(columns={"index":"ts"}), on="ts", how="left")
+    bad_cnt = j2["count"].fillna(0) < nmin
+    for ts in j2.loc[bad_cnt, "ts"].tolist():
+        _append_issue(issues, int(ts), "R33_COUNT_MISMATCH")
 
 # =============================
-# Формирование dq_notes и итоговая валидация
+# Основная точка входа
 # =============================
-
-def _notes_from_flags(flags: np.ndarray) -> List[str]:
-    notes: List[str] = []
-    for v in flags.tolist():
-        tags = [name for bit, name in FLAG_TO_NOTE.items() if (v & (1 << bit))]
-        notes.append(";".join(tags))
-    return notes
-
 
 def validate(
     df: pd.DataFrame,
     *,
-    tf: str = "1m",
+    tf: str,
     symbol: Optional[str] = None,
     repair: bool = True,
     config: Optional[QualityConfig] = None,
     ref_1m: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Валидация качества для C2.
-
-    Возвращает (df_out, issues_df).
-    df_out содержит dq_flags, dq_notes и все правки.
-
-    Параметры:
-      tf: таймфрейм входного df ("1m"|"5m"|"15m"|"1h").
-      symbol: тикер для включения в issues.
-      repair: применять безопасные правки (OHLC-границы, neg_v→0, вставка синтетик при малых пропусках для 1m).
-      ref_1m: эталонный 1m для сверок R30–R33 (для tf∈{5m,15m,1h}).
+    """
+    Валидация данных C2. Возвращает (санитайзнутый df, issues_df).
+    Совместимая сигнатура: validate(df, tf, symbol, repair, config, ref_1m).
     """
     cfg = config or QualityConfig()
-    out = _ensure_utc_index(df)
+    tf_ms = _tf_ms(tf)
 
-    # Выравнивание к правой границе минуты (только 1m)
-    out, mis_mask_old = _align_to_right_boundary(out, tf=tf, tol_sec=cfg.misaligned_tolerance_seconds)
+    work = _ensure_ts(df)
+    issues: List[Dict[str, Any]] = []
 
-    # Заполнение небольших внутренних разрывов (только 1m)
-    gap_mask_new = np.zeros(len(out), dtype=bool)
-    if tf == "1m" and repair:
-        out, gap_mask_new = _fill_small_internal_gaps(out, threshold=cfg.missing_fill_threshold)
+    # Время/структура
+    work = _rule_R01_DUP_TS(work, issues)
+    work = _rule_R02_TS_FUTURE(work, tf_ms, issues)
+    work = _rule_R03_TS_MISALIGNED(work, tf_ms, cfg.misaligned_tolerance_seconds, issues)
 
-    # Базовые правки
-    out, issues, flags = _apply_rules_basic(out if repair else out.copy())
+    # Инварианты
+    work = _rule_R10_NEG_PRICE(work, issues)
+    work = _rule_R11_NEG_VOL(work, issues)
+    work = _rule_R12_NAN(work, issues)
+    work = _rule_R13_OHLC_ORDER(work, issues)
+    work = _rule_R14_H_LT_L(work, issues)
 
-    # MISALIGNED_TS: отметка тех, кто реально сдвинулся
-    if len(mis_mask_old) == len(df) and mis_mask_old.any():
-        aligned_right = df.index.ceil("min")
-        mis_right = aligned_right[mis_mask_old]
-        aligned_pos_mask = out.index.isin(mis_right)
-        if aligned_pos_mask.any():
-            flags = (flags | np.where(aligned_pos_mask, (1 << BIT_MISALIGNED), 0)).astype(np.int32)
-            for ts in out.index[aligned_pos_mask]:
-                issues.append({
-                    "ts": ts,
-                    "code": "MISALIGNED_TS",
-                    "note": "aligned to right boundary",
-                    "severity": "low",
-                    "action": "align_right",
-                    "dq_rank": 5,
-                })
+    # Статистика
+    _rule_R20_VOL_SPIKE(work, issues, cfg.vol_window, cfg.z_thr_vol)
+    _rule_R21_ATR_SPIKE(work, issues, cfg.atr_window, cfg.z_thr_atr)
+    _rule_R22_RET_SPIKE(work, issues, cfg.ret_window, cfg.z_thr_ret)
 
-    # Флаги и issues по вставленным барам
-    if "is_gap" in out.columns:
-        gap_arr = out["is_gap"].to_numpy(dtype=bool)
-        if gap_arr.any():
-            flags = (flags | np.where(gap_arr, (1 << BIT_GAP), 0)).astype(np.int32)
-            for ts in out.index[gap_arr]:
-                issues.append({
-                    "ts": ts,
-                    "code": "MISSING",
-                    "note": "synthetic minute inserted",
-                    "severity": "low",
-                    "action": "synthetic_flat_bar",
-                    "dq_rank": 1,
-                })
-        if gap_mask_new.shape == flags.shape and gap_mask_new.any():
-            flags = (flags | np.where(gap_mask_new, (1 << BIT_MISSING_FILL), 0)).astype(np.int32)
-            for ts in out.index[gap_mask_new]:
-                issues.append({
-                    "ts": ts,
-                    "code": "MISSING_FILLED",
-                    "note": "gap filled by synthesizer",
-                    "severity": "low",
-                    "action": "synthetic_flat_bar",
-                    "dq_rank": 2,
-                })
+    # Согласованность TF против 1m
+    if ref_1m is not None and tf != "1m":
+        ref = _ensure_ts(ref_1m)
+        _rule_R30_R31_R32_R33(work, ref, tf, issues, cfg.epsilon_rel)
 
-    # Статистические флаги R20–R22
-    stat_issues, stat_flags = _flag_spikes(out, cfg=cfg)
-    if stat_issues:
-        issues.extend(stat_issues)
-    if len(stat_flags) == len(flags):
-        flags |= stat_flags.astype(np.int32)
+    # Итоговый df: канонический порядок
+    cols = [c for c in ["ts", "o", "h", "l", "c", "v", "t", "is_gap"] if c in work.columns]
+    work = work.sort_values("ts").reset_index(drop=True)[cols]
 
-    # Согласованность агрегатов R30–R33
-    cons_issues, cons_flags = _consistency_checks(out, tf=tf, ref_1m=ref_1m, cfg=cfg)
-    if cons_issues:
-        issues.extend(cons_issues)
-    if len(cons_flags) == len(flags):
-        flags |= cons_flags.astype(np.int32)
-
-    # Итоговые заметки
-    out["dq_flags"] = flags
-    out["dq_notes"] = _notes_from_flags(flags)
-
-    # Обогащение issues служебными полями, сортировка
-    if issues:
-        for rec in issues:
-            if symbol is not None:
-                rec.setdefault("symbol", symbol)
-            rec.setdefault("tf", tf)
-        issues_df = pd.DataFrame(issues, columns=[
-            "ts", "code", "note", "severity", "action", "dq_rank", "symbol", "tf"
-        ])
-        issues_df = issues_df.sort_values(["ts", "dq_rank", "code"]).reset_index(drop=True)
+    # Issues → DataFrame + нормализация
+    issues_df = pd.DataFrame(issues, columns=["ts", "code", "note"]).drop_duplicates()
+    if len(issues_df):
+        if symbol is not None:
+            issues_df["symbol"] = symbol
+        if tf is not None:
+            issues_df["tf"] = tf
+        issues_df = normalize_issues_df(issues_df)
     else:
-        issues_df = pd.DataFrame(columns=[
-            "ts", "code", "note", "severity", "action", "dq_rank", "symbol", "tf"
-        ])
+        issues_df = normalize_issues_df(pd.DataFrame(columns=["ts", "code", "note", "symbol", "tf"]))
 
-    return out, issues_df
+    return work, issues_df

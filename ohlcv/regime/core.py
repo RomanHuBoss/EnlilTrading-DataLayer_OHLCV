@@ -46,7 +46,6 @@ class RegimeConfig:
 
 def _ensure_input(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    # Разрешаем как индекс‑время, так и колонку ts
     if "ts" not in out.columns and isinstance(out.index, pd.DatetimeIndex):
         ts = out.index.tz_convert("UTC") if out.index.tz is not None else out.index.tz_localize("UTC")
         out["ts"] = (ts.view("int64") // 1_000_000).astype("int64")
@@ -104,7 +103,6 @@ def _rv(logret: pd.Series, n: int) -> pd.Series:
 
 def _D1_adx_trend(df: pd.DataFrame, cfg: RegimeConfig) -> pd.Series:
     pdi, mdi, adx = _adx(df["h"], df["l"], df["c"], cfg.T_adx, cfg.T_di)
-    # Сигнал направления по DI; подтверждение ADX
     dir_raw = np.sign((pdi - mdi).fillna(0.0))
     strong = (adx >= cfg.adx_thr).astype(int)
     sig = (dir_raw * strong).astype(float).fillna(0.0)
@@ -119,7 +117,6 @@ def _D3_changepoint(df: pd.DataFrame, cfg: RegimeConfig) -> pd.Series:
     with np.errstate(divide="ignore"):
         lr = np.log(df["c"]).diff()
     z = _zscore(lr.abs(), cfg.z_window)
-    # событие смены — редкий импульс волатильности; направление по знаку lr
     event = (z > cfg.z_thr).astype(int)
     sig = np.sign(lr).fillna(0.0) * event
     return sig.replace(np.nan, 0.0)
@@ -129,9 +126,8 @@ def _D4_hmm_proxy(df: pd.DataFrame, cfg: RegimeConfig) -> pd.Series:
     with np.errstate(divide="ignore"):
         lr = np.log(df["c"]).diff()
     rv = _rv(lr, cfg.N_hmm)
-    # Квантиль по скользящему окну N_hmm
     q = rv.rolling(cfg.N_hmm, min_periods=max(8, cfg.N_hmm // 6)).quantile(cfg.calm_threshold)
-    calm = (rv <= q).astype(int)  # 1 — calm, 0 — volatile
+    calm = (rv <= q).astype(int)
     return calm.fillna(0).astype(float)
 
 
@@ -140,9 +136,7 @@ def _D4_hmm_proxy(df: pd.DataFrame, cfg: RegimeConfig) -> pd.Series:
 # =============================
 
 def _stable_sign(s: pd.Series, n_conf: int) -> pd.Series:
-    """Требование удержания знака не менее n_conf баров подряд."""
     x = s.fillna(0.0).astype(float)
-    # Ряды непрерывного согласия знака
     same = np.sign(x).replace(0.0, np.nan)
     grp = (same != same.shift()).cumsum()
     run = same.groupby(grp).transform(lambda g: np.arange(1, len(g) + 1)).fillna(0)
@@ -157,7 +151,6 @@ def _apply_cooldown(sig: pd.Series, n_cd: int) -> pd.Series:
     prev = 0.0
     for i, v in enumerate(s):
         if v != 0.0 and np.sign(v) != np.sign(prev):
-            # смена направления → включить cooldown
             cd = n_cd
         if cd > 0:
             out[i] = 0.0
@@ -169,54 +162,39 @@ def _apply_cooldown(sig: pd.Series, n_cd: int) -> pd.Series:
 
 
 def infer_regime(df_in: pd.DataFrame, tf: str, cfg: Optional[RegimeConfig] = None) -> pd.DataFrame:
-    """Определение рыночного режима.
-
-    Вход: DataFrame c колонками ts,o,h,l,c (минимум ts,c; h/l восстанавливаются как NaN→c при отсутствии).
-    Выход: DataFrame с колонками:
-      ts:int64, regime:{-1,0,1}, regime_name:str, score:int, d1_adx_trend, d2_donch_breakout, d3_changepoint, d4_calm
-    """
     cfg = cfg or RegimeConfig()
     df = _ensure_input(df_in)
 
-    # Восстановить h/l, если отсутствуют
     for col in ["h", "l"]:
         if df[col].isna().all():
             df[col] = df["c"]
 
-    d1 = _D1_adx_trend(df, cfg)  # {-1,0,1}
-    d2 = _D2_donch(df, cfg)      # {-1,0,1}
-    d3 = _D3_changepoint(df, cfg)  # редкие {-1,0,1}
-    d4 = _D4_hmm_proxy(df, cfg)    # {0(calm=0?),1(calm)}
+    d1 = _D1_adx_trend(df, cfg)
+    d2 = _D2_donch(df, cfg)
+    d3 = _D3_changepoint(df, cfg)
+    d4 = _D4_hmm_proxy(df, cfg)
 
-    # Базовые голоса по направлению — D1, D2 (трендовые), D3 влияет на уверенность
     votes = pd.DataFrame({"d1": d1, "d2": d2}, index=df.index)
 
-    # Требование удержания сигнала n_conf
     n_conf = cfg.N_conf.get(tf, 5)
     v1 = _stable_sign(votes["d1"], n_conf)
     v2 = _stable_sign(votes["d2"], n_conf)
 
-    # Суммарный счёт голосов
     sgn_sum = v1.add(v2, fill_value=0.0)
     score = (v1.ne(0).astype(int) + v2.ne(0).astype(int)).astype(int)
 
-    # Порог голосов
     regime_raw = sgn_sum.apply(np.sign)
     enough = (score >= cfg.vote_K).astype(int)
     regime = (regime_raw * enough).fillna(0.0)
 
-    # Влияние calm: если calm==1 → режим 0
     calm_mask = (d4 >= 1.0)
     regime = regime.where(~calm_mask, 0.0)
 
-    # События смены (D3) уменьшают уверенность на бар смены
     regime = regime.where(d3 == 0.0, 0.0)
 
-    # Cooldown
     n_cd = cfg.N_cooldown.get(tf, 5)
     regime = _apply_cooldown(regime, n_cd)
 
-    # Оформление
     out = pd.DataFrame({
         "ts": df["ts"].astype("int64"),
         "d1_adx_trend": v1.astype("float64"),
@@ -229,6 +207,5 @@ def infer_regime(df_in: pd.DataFrame, tf: str, cfg: Optional[RegimeConfig] = Non
     out["regime"] = regime.astype("int8")
     out["regime_name"] = out["regime"].map({-1: "bear", 0: "calm", 1: "bull"}).astype("string")
 
-    # Порядок колонок
     out = out[["ts", "regime", "regime_name", "score", "d1_adx_trend", "d2_donch_breakout", "d3_changepoint", "d4_calm"]]
     return out.reset_index(drop=True)

@@ -11,41 +11,31 @@ from typing import Optional
 import pandas as pd
 
 
+# =============================
+# Модель tail-сайдкара
+# =============================
 @dataclass(frozen=True)
 class TailInfo:
     symbol: str
     tf: str
-    latest_ts_ms: Optional[int]
-    rows_total: Optional[int]
-    data_hash: Optional[str]
-    updated_at: str
+    latest_ts_ms: int
+    updated_at_iso: str
 
+
+# =============================
+# Вспомогательные утилиты
+# =============================
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _tail_dir(root: Path | str, symbol: str) -> Path:
+    return Path(root) / symbol / "tail"
+
+
 def _sidecar_path(root: Path | str, symbol: str, tf: str) -> Path:
-    return Path(root).expanduser().resolve() / symbol / f"{tf}.latest.json"
-
-
-def read(root: Path | str, symbol: str, tf: str) -> TailInfo:
-    p = _sidecar_path(root, symbol, tf)
-    if not p.exists():
-        return TailInfo(symbol=symbol, tf=tf, latest_ts_ms=None, rows_total=None, data_hash=None, updated_at=_now_iso())
-    try:
-        blob = json.loads(p.read_text(encoding="utf-8"))
-        return TailInfo(
-            symbol=str(blob.get("symbol", symbol)),
-            tf=str(blob.get("tf", tf)),
-            latest_ts_ms=blob.get("latest_ts_ms"),
-            rows_total=blob.get("rows_total"),
-            data_hash=blob.get("data_hash"),
-            updated_at=str(blob.get("updated_at", _now_iso())),
-        )
-    except Exception:
-        # повреждённый sidecar — вернём пустой
-        return TailInfo(symbol=symbol, tf=tf, latest_ts_ms=None, rows_total=None, data_hash=None, updated_at=_now_iso())
+    return _tail_dir(root, symbol) / f"{tf}.tail.json"
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
@@ -55,49 +45,100 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     os.replace(tmp, path)
 
 
+# =============================
+# API tail-сайдкара
+# =============================
+
 def write(root: Path | str, info: TailInfo) -> Path:
+    """Пишет tail JSON атомарно и возвращает путь."""
     p = _sidecar_path(root, info.symbol, info.tf)
     _atomic_write_json(p, asdict(info))
     return p
 
 
-def update(root: Path | str, symbol: str, tf: str, *, latest_ts_ms: Optional[int], rows_total: Optional[int], data_hash: Optional[str]) -> TailInfo:
-    info = TailInfo(symbol=symbol, tf=tf, latest_ts_ms=latest_ts_ms, rows_total=rows_total, data_hash=data_hash, updated_at=_now_iso())
-    write(root, info)
-    return info
+def read(root: Path | str, symbol: str, tf: str) -> Optional[TailInfo]:
+    """Читает tail JSON; возвращает TailInfo или None, если нет файла."""
+    p = _sidecar_path(root, symbol, tf)
+    if not p.exists():
+        return None
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        return TailInfo(
+            symbol=obj.get("symbol", symbol),
+            tf=obj.get("tf", tf),
+            latest_ts_ms=int(obj["latest_ts_ms"]),
+            updated_at_iso=str(obj.get("updated_at_iso") or _now_iso()),
+        )
+    except Exception:
+        return None
 
 
-def refresh_from_parquet(root: Path | str, symbol: str, tf: str) -> TailInfo:
-    """Обновляет sidecar, читая только столбец ts из parquet."""
-    from .parquet_store import parquet_path  # локальный импорт, чтобы избежать циклов
-
-    p = parquet_path(root, symbol, tf)
-    if not Path(p).exists():
-        info = TailInfo(symbol=symbol, tf=tf, latest_ts_ms=None, rows_total=None, data_hash=None, updated_at=_now_iso())
+def update(
+    root: Path | str,
+    symbol: str,
+    tf: str,
+    *,
+    latest_ts_ms: Optional[int] = None,
+) -> TailInfo:
+    """Обновляет tail: монотонно повышает latest_ts_ms и пишет ISO-время обновления."""
+    cur = read(root, symbol, tf)
+    if cur is None:
+        if latest_ts_ms is None:
+            raise ValueError("latest_ts_ms обязателен при первом создании tail")
+        info = TailInfo(symbol=symbol, tf=tf, latest_ts_ms=int(latest_ts_ms), updated_at_iso=_now_iso())
         write(root, info)
         return info
-    # чтение только индекса ts для скорости
-    df = pd.read_parquet(p, columns=["ts"])  # type: ignore[arg-type]
-    if len(df) == 0:
-        info = TailInfo(symbol=symbol, tf=tf, latest_ts_ms=None, rows_total=0, data_hash=None, updated_at=_now_iso())
-        write(root, info)
-        return info
-    ts = pd.to_datetime(df["ts"], utc=True)
-    latest = int(ts.iloc[-1].value // 1_000_000)
-    info = TailInfo(symbol=symbol, tf=tf, latest_ts_ms=latest, rows_total=int(len(df)), data_hash=None, updated_at=_now_iso())
+    new_ts = cur.latest_ts_ms if latest_ts_ms is None else max(int(latest_ts_ms), int(cur.latest_ts_ms))
+    info = TailInfo(symbol=symbol, tf=tf, latest_ts_ms=new_ts, updated_at_iso=_now_iso())
     write(root, info)
     return info
 
 
-def update_from_df(root: Path | str, symbol: str, tf: str, df: pd.DataFrame, *, data_hash: Optional[str] = None) -> TailInfo:
-    """Обновляет sidecar по свежезаписанному df (индекс tz-aware DatetimeIndex)."""
-    if df.empty:
-        # не перезаписываем хвост пустым
-        return read(root, symbol, tf)
-    if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
-        raise TypeError("ожидается tz-aware DatetimeIndex")
-    latest = int(df.index[-1].value // 1_000_000)
-    # rows_total получить невозможно без чтения всего файла; оставляем None
-    info = TailInfo(symbol=symbol, tf=tf, latest_ts_ms=latest, rows_total=None, data_hash=data_hash, updated_at=_now_iso())
-    write(root, info)
-    return info
+# =============================
+# Parquet-хвост последних N дней
+# =============================
+
+def write_parquet_tail(
+    root: Path | str,
+    symbol: str,
+    tf: str,
+    df: pd.DataFrame,
+    *,
+    days: int = 14,
+) -> Path:
+    """Пишет tail/<tf>.tail.parquet с последними N днями данных.
+
+    Ожидает колонку 'ts' (мс). Если индекс DatetimeIndex — будет использован он.
+    """
+    out_dir = _tail_dir(root, symbol)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{tf}.tail.parquet"
+
+    if "ts" in df.columns:
+        ts = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        sub = df.copy()
+    elif isinstance(df.index, pd.DatetimeIndex):
+        ts = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
+        sub = df.reset_index().rename(columns={df.index.name or "index": "ts"}).copy()
+        sub["ts"] = (ts.view("int64") // 1_000_000).astype("int64")
+    else:
+        raise ValueError("ожидается колонка 'ts' или DatetimeIndex")
+
+    cutoff = ts.max() - pd.Timedelta(days=days)
+    mask = ts >= cutoff
+    sub = sub.loc[mask].reset_index(drop=True)
+
+    # запись parquet: предпочтительно через pyarrow
+    try:
+        import pyarrow as pa  # type: ignore
+        import pyarrow.parquet as pq  # type: ignore
+        table = pa.Table.from_pandas(sub, preserve_index=False)
+        pq.write_table(table, path)
+    except Exception:
+        sub.to_parquet(path)
+
+    # обновить JSON tail максимальным ts
+    max_ts = int(sub["ts"].max()) if len(sub) else int((ts.max().value // 1_000_000))
+    update(root, symbol, tf, latest_ts_ms=max_ts)
+
+    return path

@@ -1,0 +1,20 @@
+symbol: BTCUSDT
+tf: 15m
+
+params:
+  atr: 14
+  rsi: 14
+  adx: 14
+  donch: 20
+  z_price: 60
+  z_vol: 60
+  vwap_roll: 96
+  build_version: "C3-1.0"
+
+outputs:
+  format: parquet
+  path: /data/features/{symbol}_{tf}.parquet
+  include_meta: true
+
+logging:
+  level: INFO

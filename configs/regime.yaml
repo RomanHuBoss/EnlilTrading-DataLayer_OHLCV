@@ -1,0 +1,29 @@
+ensemble:
+  vote_K: 3
+  N_conf:
+    "5m": 5
+    "15m": 5
+    "1h": 3
+  N_cooldown:
+    "5m": 10
+    "15m": 8
+    "1h": 3
+
+D1_adx:
+  T_adx: 22
+  T_di: 5
+  adx_thr: 18.0
+
+D2_donch:
+  window: 20
+
+D3_changepoint:
+  z_window: 64
+  z_thr: 3.5
+
+D4_hmm_proxy:
+  N_hmm: 180
+  calm_threshold: 0.60
+
+logging:
+  level: INFO

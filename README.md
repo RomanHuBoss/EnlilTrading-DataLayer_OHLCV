@@ -1,173 +1,114 @@
-# Проект: Маркет‑данные и режимы рынка
+# OHLCV Data Layer — C1/C2/C3/C4
 
-Комплект модулей для загрузки минутных OHLCV (Bybit), очистки и выравнивания, ресемплинга в целевые ТФ, построения признаков и (опционально) детекции рыночных режимов.
+## Содержание
 
-Состав:
-- **C1 · Data Layer (OHLCV)** — загрузка 1m по Bybit, нормализация, календаризация, Parquet‑хранилище, ресемплинг 1m→5m/15m/1h, отчёты по пропускам, DataReader.
-- **C2 · Data Quality** — инварианты OHLC, выравнивание к минутному календарю, флаг `is_gap`, агрегированные отчёты и порог для CI. Реализовано внутри `ohlcv.core.validate` и CLI `report-missing` (см. ниже).
-- **C3 · Features** — минимальный согласованный набор признаков по постановке: волатильность, тренд/импульс, свечные относительные метрики, VWAP, объёмные показатели, Donchian и т.п. CLI `c3-features`.
-- **C4 · Regime (опционально)** — ансамбль детекторов (ADX/Donchian/BOCPD/HMM). Пакет в исходниках, сборка в дистрибутив не включена.
+* Архитектура и контракты (C1–C4)
+* Форматы данных и колонок
+* CLI команды и коды возврата
+* Структура хранилища (Parquet Store)
+* Конфиги
+* Совместимость и миграция
 
 ---
+
+## Архитектура
+
+* **C1 Data Layer**: нормализация 1m, выравнивание минутной сетки, ресемплинг 1m→5m/15m/1h, хвостовой кэш `tail`.
+* **C2 Data Quality**: правила валидации (R01–R14, R20–R23, R30–R33), отчёты `issues` в каноне.
+* **C3 Features**: стабильные фичи (ATR/RSI/ADX/Donchian/VWAP/Z-score/объёмные), мета‑поля и строгая схема.
+* **C4 Regime**: ансамблевый режим рынка (ADX‑тренд, Donchian‑прорыв, changepoint по z‑score, HMM‑proxy RV).
+
+Пакеты:
+
+```
+ohlcv.core         # C1: normalize/align/resample
+ohlcv.io           # C1: parquet store + tail
+ohlcv.api          # C1: Bybit v5 клиент
+ohlcv.quality      # C2: validator + issues
+ohlcv.features     # C3: build + schema
+ohlcv.regime       # C4: infer_regime
+```
+
+## Форматы данных
+
+### Канон 1m и агрегатов
+
+* Индекс/поле времени: `ts` — правая граница бара, миллисекунды UTC (`int64`).
+* Колонки: `o,h,l,c,v[,t],is_gap` (`float64`, `is_gap: bool`).
+* Пропуски минут заполняются **синтетическим плоским баром** (`o=h=l=c=prev_close`, `v=0`, `is_gap=true`).
+
+### `issues` (C2)
+
+Столбцы: `ts,code,note,severity,action,dq_rank,symbol,tf`.
+
+* Коды: R01–R14, R20–R23, R30–R33 (+ служебные). Алиасы приводятся к канону.
+
+### Фичи (C3)
+
+`ts:int64, symbol:str, tf:str, f_valid_from:int64, f_build_version:str, f_*:float64`.
+
+### Режим (C4)
+
+`ts:int64, regime:{-1,0,1}, regime_name:{bear,calm,bull}, score:int, d1_*, d2_*, d3_*, d4_*`.
+
+## CLI
+
+Двоичный скрипт: `ohlcv`.
+
+### C1
+
+* `ohlcv datalayer resample SRC.parquet --dst-tf {5m|15m|1h} --out OUT.parquet [--compression zstd]`
+* `ohlcv datalayer missing-report SRC_1m.parquet [--since-ms MS] [--until-ms MS] [--fail-gap-pct 0..1]`
+
+  * Возврат `2`, если доля пропусков > порога.
+* `ohlcv datalayer backfill SYMBOL --store STORE_DIR --since-ms MS --until-ms MS [параметры API]`
+
+Совместимые алиасы:
+
+* `ohlcv c1-resample`, `ohlcv c1-backfill`, `ohlcv c1-report-missing`, `ohlcv c1-update`.
+
+### C2
+
+* `ohlcv dataquality validate IN.parquet [--tf TF] [--symbol S] [--ref-1m REF.parquet] [--out-dir DIR] [--quality-json OUT.json] [--write-inplace] [--cfg-json CFG.json]`
+
+  * Пишет очищенный parquet и `*.issues.parquet`.
+
+## Структура хранилища
+
+```
+<STORE>/<SYMBOL>/
+  1m.parquet
+  5m.parquet
+  15m.parquet
+  1h.parquet
+  tail/
+    1m.tail.json
+    1m.tail.parquet
+```
+
+* Запись идемпотентная: мердж по `ts` (последний выигрывает), атомарная.
+* Метаданные footer: ключ `c1.meta` с `source,symbol,tf,rows,data_hash,build_signature`.
+
+## Конфиги (пример)
+
+* `configs/datalayer.yaml`: API, store, ресемплинг, пороги C1.
+* `configs/dataquality.yaml`: допуски/окна/пороги C2, пути вывода.
+* `configs/features.yaml`: окна C3, путь фич.
+* `configs/regime.yaml`: параметры ансамбля и детекторов C4.
+
+## Контракты функций
+
+* `align_and_flag_gaps(df_1m, strict=True) -> (df_aligned, ValidateStats)`
+* `resample_1m_to(df_1m, dst_tf) -> df_tf`
+* `validate(df, tf, symbol=None, repair=True, config=None, ref_1m=None) -> (df_clean, issues_df)`
+* `build_features(df_in, symbol, tf, cfg=None) -> df_features`
+* `infer_regime(df_in, tf, cfg=None) -> df_regime`
+
+## Совместимость/миграция
+
+* Старые импорты `c4_regime` перенаправлены в `ohlcv.regime`.
+* CLI-совместимость: `report-missing`, `c1-update`, `c1-*`, `c2-validate` сохранены.
+
 ## Требования
-- Python ≥ 3.9
-- `numpy`, `pandas`, `pyarrow`, `requests` (см. `pyproject.toml`)
 
-Установка для разработки:
-```bash
-pip install -e .[test]
-```
-
----
-## Быстрый старт
-### 1) Загрузка минутных данных (C1)
-```bash
-c1-ohlcv backfill \
-  --symbol BTCUSDT \
-  --store ./data \
-  --since-ms 1700000000000 \
-  --until-ms 1700003600000
-```
-Выход: `./data/BTCUSDT/1m.parquet` с метаданными `c1.meta` в footer.
-
-Догрузка хвоста:
-```bash
-c1-ohlcv update --symbol BTCUSDT --store ./data
-```
-
-Ресемплинг 1m→5m:
-```bash
-c1-ohlcv resample --symbol BTCUSDT --store ./data --dst-tf 5m
-```
-
-Отчёт по пропускам (C2):
-```bash
-c1-ohlcv report-missing \
-  --symbol BTCUSDT --store ./data \
-  --since-ms 1700000000000 --until-ms 1700003600000 \
-  --fail-gap-pct 5
-```
-Код возврата `2` при превышении порога пропусков.
-
-### 2) Построение признаков (C3)
-```bash
-c3-features build \
-  input.parquet \
-  features.parquet \
-  --symbol BTCUSDT --tf 5m \
-  --config configs/features.example.yaml
-```
-Выход содержит ключевые столбцы: `f_rv_*, f_adx_14, f_pdi_14, f_mdi_14, f_donch_width_pct_*, f_rsi_14, f_vwap_*`, свечные `%`‑метрики, `f_valid_from`, `f_build_version`.
-
----
-## Структура репозитория
-```
-ohlcv/
-  api/bybit.py            # клиент Bybit v5 (публичный), backoff+джиттер
-  cli.py                  # CLI: backfill, update, resample, read, report-missing
-  core/validate.py        # нормализация 1m, календарь, is_gap
-  core/resample.py        # агрегация 1m→{5m,15m,1h}
-  io/parquet_store.py     # Parquet: идемпотентная запись, метаданные c1.meta
-  io/tail_cache.py        # sidecar <symbol>/<tf>.latest.json
-  datareader.py           # DataReader для диапазонов и дней
-  utils/timeframes.py     # парсинг/выравнивание таймфреймов
-  version.py              # __version__, build_signature()
-
-ohlcv/features/
-  __init__.py, core.py, schema.py, cli.py, utils.py
-
-c4_regime/                # ансамбль детекторов (опционально)
-
-configs/
-  features.example.yaml   # пример конфигурации C3
-
-tests/
-  test_*.py               # юнит‑ и интеграционные тесты
-```
-
----
-## Схемы данных
-### Паркет‑хранилище (C1)
-- Путь: `<root>/<symbol>/<tf>.parquet`
-- Индекс‑колонка: `ts` (tz‑aware, UTC, timestamp[ns])
-- Данные: `o,h,l,c,v` (float64), опционально `t` (turnover, float64), `is_gap` (bool)
-- Сжатие: `zstd(level=7)`; группировка: `row_group_size=256_000`; `use_dictionary=True`
-- Метаданные (footer, ключ `c1.meta`):
-  ```json
-  {
-    "symbol": "BTCUSDT",
-    "tf": "1m",
-    "rows": 123456,
-    "min_ts": "2024-01-01T00:00:00+00:00",
-    "max_ts": "2024-01-02T00:00:00+00:00",
-    "generated_at": "<UTC ISO>",
-    "data_hash": "<sha1>",
-    "build_signature": "C1-0.1.0+p<psha>+g<sha>[-dirty]",
-    "schema": ["ts","o","h","l","c","v","t","is_gap"],
-    "schema_version": 1,
-    "zstd_level": 7,
-    "row_group_size": 256000
-  }
-  ```
-
-### Features (C3)
-- Вход: OHLCV с колонками `timestamp_ms,start_time_iso,open,high,low,close,volume` или паркет с индексом `ts`.
-- Выход: признаки по постановке C3. Прогрев `f_valid_from` = максимум окон.
-- Версионирование: `f_build_version = C3-<ver>+p<psha>(+g<sha>[-dirty])`.
-
----
-## DataReader
-Высокоуровневое чтение диапазонов и суток:
-```python
-from ohlcv import DataReader
-r = DataReader("./data")
-# выборка с parquet‑filters
-df, st = r.read_range("BTCUSDT", "1m", start_ms=1700000000000, end_ms=1700003600000, columns=["o","c"]) 
-# выравнивание к минутному календарю + флаг is_gap
-aligned, st2 = r.read_range("BTCUSDT", "1m", start_ms=..., end_ms=..., align_1m=True)
-# сутки UTC
-day_df, _ = r.read_day_utc("BTCUSDT", "5m", "2024-01-01")
-```
-Sidecar‑кэш: `<root>/<symbol>/<tf>.latest.json` с полями `latest_ts_ms, rows_total, data_hash, updated_at`.
-
----
-## CI/Качество (C2)
-- Проверка непрерывности минутных баров: `c1-ohlcv report-missing ... --fail-gap-pct <THRESHOLD>` → код `2` при превышении.
-- Инварианты: `high>=low`, `open/close ∈ [low,high]`. При `strict=True` нарушения вызывают ошибку.
-
----
-## Примеры пайплайнов
-### От сырого 1m к признакам 5m
-```bash
-# 1) минутные бары
-c1-ohlcv backfill --symbol BTCUSDT --store ./data --since-ms $SINCE --until-ms $UNTIL
-# 2) ресемплинг 1m→5m
-c1-ohlcv resample --symbol BTCUSDT --store ./data --dst-tf 5m
-# 3) признаки 5m
-c3-features build ./data/BTCUSDT/5m.parquet ./data/BTCUSDT/features_5m.parquet --symbol BTCUSDT --tf 5m
-```
-
----
-## Переменные окружения
-- `GIT_COMMIT` / `CI_COMMIT_SHA` / `SOURCE_VERSION` — используются для формирования `build_signature`.
-
----
-## Тесты
-```bash
-pytest -q
-```
-
----
-## Траблшутинг
-- `pyarrow` отсутствует → Parquet‑операции недоступны. Установить зависимость.
-- `ValueError: ожидался столбец 'ts'` при чтении — повреждён файл/неверный формат; перезаписать через `write_idempotent`.
-- Пустые ответы Bybit на свежем окне — возможная пауза/делист; повторить с меньшим интервалом.
-
----
-## Версионирование
-- `ohlcv/version.py::__version__` — версия пакета.
-- `build_signature(params, component)` — сигнатура сборки: `C1-<ver>+p<psha>+g<sha>[-dirty]`.
-
----
-## Лицензия
-Proprietary
+* Python ≥ 3.10, `pandas>=2.0`, `numpy>=1.23`, `click>=8.1`, `requests>=2.28`, опционально `pyarrow>=14`.

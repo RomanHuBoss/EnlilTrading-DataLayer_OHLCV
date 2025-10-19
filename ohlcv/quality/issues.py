@@ -17,138 +17,90 @@ __all__ = [
 
 
 # =============================
-# Спецификация и реестр кодов C2
+# Спецификация issue
 # =============================
-
 @dataclass(frozen=True)
 class IssueSpec:
     code: str
     description: str
-    severity: str  # low|medium|high
-    action: str    # описание корректирующего действия/рекомендации
-    dq_rank: int   # приоритет сортировки (чем больше, тем важнее)
+    severity: str  # "low" | "medium" | "high" | "crit"
+    action: str    # "flag" | "drop" | "fix" | "gapify" | "synthetic_flat_bar"
+    dq_rank: int   # 1=высший приоритет
 
 
-# Канонический реестр. Значения dq_rank согласованы с validator.py
+# =============================
+# Реестр кодов C2
+# =============================
 ISSUE_REGISTRY: Dict[str, IssueSpec] = {
-    # Базовые
-    "NEG_V": IssueSpec(
-        code="NEG_V",
-        description="negative volume observed; clipped to zero",
-        severity="medium",
-        action="clip_to_zero",
-        dq_rank=30,
-    ),
-    "INV_OHLC": IssueSpec(
-        code="INV_OHLC",
-        description="OHLC invariant violated; bounds fixed",
-        severity="high",
-        action="fix_bounds",
-        dq_rank=40,
-    ),
-    "MISALIGNED_TS": IssueSpec(
-        code="MISALIGNED_TS",
-        description="timestamp misaligned; aligned to right boundary",
-        severity="low",
-        action="align_right",
-        dq_rank=5,
-    ),
-    "MISSING": IssueSpec(
-        code="MISSING",
-        description="calendar gap; synthetic minute inserted",
-        severity="low",
-        action="synthetic_flat_bar",
-        dq_rank=1,
-    ),
-    "MISSING_FILLED": IssueSpec(
-        code="MISSING_FILLED",
-        description="gap filled by synthesizer (flat bar)",
-        severity="low",
-        action="synthetic_flat_bar",
-        dq_rank=2,
-    ),
+    # Время/структура
+    "R01_DUP_TS": IssueSpec("R01_DUP_TS", "duplicate timestamp (last wins)", "high", "drop", 1),
+    "R02_TS_FUTURE": IssueSpec("R02_TS_FUTURE", "bar in the future (beyond window)", "crit", "drop", 1),
+    "R03_TS_MISALIGNED": IssueSpec("R03_TS_MISALIGNED", "timestamp misaligned to tf", "medium", "fix", 2),
 
-    # R20–R22 статистические флаги
-    "R20_VOL_SPIKE": IssueSpec(
-        code="R20_VOL_SPIKE",
-        description="abnormal volume spike vs rolling baseline",
-        severity="low",
-        action="flag",
-        dq_rank=10,
-    ),
-    "R21_ATR_SPIKE": IssueSpec(
-        code="R21_ATR_SPIKE",
-        description="abnormal ATR spike vs rolling baseline",
-        severity="medium",
-        action="flag",
-        dq_rank=20,
-    ),
-    "R22_RET_SPIKE": IssueSpec(
-        code="R22_RET_SPIKE",
-        description="abnormal absolute return spike",
-        severity="medium",
-        action="flag",
-        dq_rank=20,
-    ),
+    # Инварианты OHLC/объём
+    "R10_NEG_PRICE": IssueSpec("R10_NEG_PRICE", "non-positive price in OHLC", "crit", "gapify", 1),
+    "R11_NEG_VOL": IssueSpec("R11_NEG_VOL", "negative volume", "medium", "fix", 2),
+    "R12_NAN": IssueSpec("R12_NAN", "NaN inside OHLC", "high", "gapify", 1),
+    "R13_OHLC_ORDER": IssueSpec("R13_OHLC_ORDER", "OHLC order violation", "high", "fix", 2),
+    "R14_H_LT_L": IssueSpec("R14_H_LT_L", "high < low", "high", "fix", 2),
 
-    # R30–R33 согласованность производных ТФ с 1m
-    "R30_OHLC_MISMATCH": IssueSpec(
-        code="R30_OHLC_MISMATCH",
-        description="aggregated OHLC differs from resampled 1m",
-        severity="high",
-        action="rebuild_from_1m",
-        dq_rank=90,
-    ),
-    "R31_VOL_MISMATCH": IssueSpec(
-        code="R31_VOL_MISMATCH",
-        description="aggregated volume differs from 1m sum",
-        severity="medium",
-        action="rebuild_from_1m",
-        dq_rank=70,
-    ),
-    "R33_COUNT_MISMATCH": IssueSpec(
-        code="R33_COUNT_MISMATCH",
-        description="missing aggregated bar vs 1m calendar",
-        severity="high",
-        action="reindex_and_fill",
-        dq_rank=80,
-    ),
+    # Статистика
+    "R20_VOL_SPIKE": IssueSpec("R20_VOL_SPIKE", "abnormal volume spike vs baseline", "low", "flag", 3),
+    "R21_ATR_SPIKE": IssueSpec("R21_ATR_SPIKE", "abnormal ATR spike vs baseline", "low", "flag", 3),
+    "R22_RET_SPIKE": IssueSpec("R22_RET_SPIKE", "abnormal return spike vs baseline", "low", "flag", 3),
+    "R23_ZERO_RUN": IssueSpec("R23_ZERO_RUN", "long run of zero volume", "low", "flag", 3),
+
+    # Согласованность TF против 1m
+    "R30_OHLC_MISMATCH": IssueSpec("R30_OHLC_MISMATCH", "aggregated ohlc mismatch vs 1m", "medium", "flag", 3),
+    "R31_VOL_MISMATCH": IssueSpec("R31_VOL_MISMATCH", "aggregated volume mismatch vs 1m", "medium", "flag", 3),
+    "R32_RANGE_MISMATCH": IssueSpec("R32_RANGE_MISMATCH", "high/low outside minute range", "high", "flag", 2),
+    "R33_COUNT_MISMATCH": IssueSpec("R33_COUNT_MISMATCH", "insufficient minute count in window", "medium", "flag", 3),
+
+    # Служебные
+    "MISSING_FILLED": IssueSpec("MISSING_FILLED", "gap filled by synthesizer (flat bar)", "low", "synthetic_flat_bar", 2),
 }
 
 
-# Синонимы/наследие → канон
+# Алиасы для совместимости с разными источниками
 CODE_ALIASES: Dict[str, str] = {
-    # Базовые
-    "inv_ohlc": "INV_OHLC",
-    "gap": "MISSING",
-    "missing": "MISSING",
-    "neg_v": "NEG_V",
-    "misaligned_ts": "MISALIGNED_TS",
-    "missing_filled": "MISSING_FILLED",
-    # Короткие
+    # R01–R03
+    "DUP_TS": "R01_DUP_TS",
+    "TS_FUTURE": "R02_TS_FUTURE",
+    "TS_MISALIGNED": "R03_TS_MISALIGNED",
+    # R10–R14
+    "NEG_PRICE": "R10_NEG_PRICE",
+    "NEG_VOL": "R11_NEG_VOL",
+    "NAN_OHLC": "R12_NAN",
+    "OHLC_ORDER": "R13_OHLC_ORDER",
+    "H_LT_L": "R14_H_LT_L",
+    # R20–R23
     "VOL_SPIKE": "R20_VOL_SPIKE",
     "ATR_SPIKE": "R21_ATR_SPIKE",
     "RET_SPIKE": "R22_RET_SPIKE",
+    "ZERO_RUN": "R23_ZERO_RUN",
+    # R30–R33
+    "OHLC_MISMATCH": "R30_OHLC_MISMATCH",
+    "VOL_MISMATCH": "R31_VOL_MISMATCH",
+    "RANGE_MISMATCH": "R32_RANGE_MISMATCH",
+    "COUNT_MISMATCH": "R33_COUNT_MISMATCH",
+    # Служебные
+    "GAP_FILLED": "MISSING_FILLED",
 }
 
 
-def canonical_code(code: Optional[str]) -> Optional[str]:
-    if code is None:
-        return None
-    key = str(code).strip()
-    if key in ISSUE_REGISTRY:
-        return key
-    key_up = key.upper()
-    if key_up in ISSUE_REGISTRY:
-        return key_up
-    return CODE_ALIASES.get(key, CODE_ALIASES.get(key_up, key_up))
-
-
 # =============================
-# Нормализация и сводки
+# Утилиты нормализации/сводки
 # =============================
-
 _DEF_COLS = ["ts", "code", "note", "severity", "action", "dq_rank", "symbol", "tf"]
+
+
+def canonical_code(code: str) -> str:
+    c = (code or "").strip().upper()
+    if c in ISSUE_REGISTRY:
+        return c
+    if c in CODE_ALIASES:
+        return CODE_ALIASES[c]
+    return c  # неизвестный — оставляем как есть
 
 
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -160,65 +112,47 @@ def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_issues_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Приведение issues к каноническому виду с заполнением значений из реестра.
-
-    - ts → datetime64[ns, UTC]
-    - code → канон + в верхнем регистре
-    - заполнение severity/action/dq_rank из ISSUE_REGISTRY, если не указаны
-    - сортировка по ts, dq_rank desc, code
-    """
-    if df is None or len(df) == 0:
-        return pd.DataFrame(columns=_DEF_COLS)
-
+    """Приведение issues к канону: типы, алиасы, заполнение spec, порядок и сортировка."""
+    if len(df) == 0:
+        return _ensure_columns(pd.DataFrame(columns=_DEF_COLS))
     out = _ensure_columns(df)
 
-    # ts → UTC
-    out["ts"] = pd.to_datetime(out["ts"], utc=True, errors="coerce")
+    # Типы
+    out["ts"] = pd.to_numeric(out["ts"], errors="coerce").astype("Int64").astype("float").astype("int64")
+    out["code"] = out["code"].astype(str).str.upper().map(canonical_code)
+    out["note"] = out["note"].astype("string").fillna(pd.NA)
+    out["symbol"] = out["symbol"].astype("string").fillna(pd.NA)
+    out["tf"] = out["tf"].astype("string").fillna(pd.NA)
 
-    # code → канон
-    out["code"] = out["code"].map(canonical_code)
-
-    # Подстановка значений из реестра
-    def _fill_row(row: pd.Series) -> pd.Series:
-        spec = ISSUE_REGISTRY.get(row["code"])  # уже upper/canonical
+    # Заполнение по реестру
+    def _fill_from_spec(row: pd.Series) -> pd.Series:
+        spec = ISSUE_REGISTRY.get(row["code"])  # type: ignore[index]
         if spec is None:
-            # неизвестный код — мягкая деградация
-            row["severity"] = row.get("severity") or "low"
-            row["action"] = row.get("action") or "flag"
-            row["dq_rank"] = row.get("dq_rank") or 0
+            # дефолты для неизвестных кодов
+            row["severity"] = row["severity"] if pd.notna(row["severity"]) else "low"
+            row["action"] = row["action"] if pd.notna(row["action"]) else "flag"
+            row["dq_rank"] = int(row["dq_rank"]) if pd.notna(row["dq_rank"]) else 5
             return row
-        if not row.get("severity"):
-            row["severity"] = spec.severity
-        if not row.get("action"):
-            row["action"] = spec.action
-        if not row.get("dq_rank"):
-            row["dq_rank"] = spec.dq_rank
+        row["severity"] = row["severity"] if pd.notna(row["severity"]) else spec.severity
+        row["action"] = row["action"] if pd.notna(row["action"]) else spec.action
+        row["dq_rank"] = int(row["dq_rank"]) if pd.notna(row["dq_rank"]) else spec.dq_rank
         return row
 
-    out = out.apply(_fill_row, axis=1)
+    out = out.apply(_fill_from_spec, axis=1)
 
-    # Категории для компактности и консистентности
-    out["severity"] = pd.Categorical(out["severity"], categories=["low", "medium", "high"], ordered=True)
+    # Удаление точных дублей и сортировка
+    out = out.drop_duplicates(subset=["ts", "code", "note", "symbol", "tf"]).sort_values(["ts", "dq_rank"]).reset_index(drop=True)
 
-    # Сортировка: время↑, важность↓, код↑
-    out = out.sort_values(["ts", "dq_rank", "code"])  # dq_rank чем больше — тем важнее; итог читается слева-направо
-    out = out.reset_index(drop=True)
-    return out
+    return out[_DEF_COLS]
 
 
 def summarize_issues(df: pd.DataFrame) -> pd.DataFrame:
-    """Групповая сводка по code/severity/action с подсчётом штук."""
-    if df is None or len(df) == 0:
-        return pd.DataFrame(columns=["code", "severity", "action", "count"]).astype({"count": "int64"})
-    g = (
-        df.groupby(["code", "severity", "action"], dropna=False)
-          .size()
-          .rename("count")
-          .reset_index()
-          .sort_values(["count", "code"], ascending=[False, True])
-    )
-    g["count"] = g["count"].astype("int64")
-    return g
+    """Сводка по кодам и уровню: counts, доля, ранжирование."""
+    norm = normalize_issues_df(df)
+    if len(norm) == 0:
+        return pd.DataFrame(columns=["code", "count", "dq_rank"]).astype({"count": "int64", "dq_rank": "int64"})
+    grp = norm.groupby(["code", "dq_rank"], as_index=False).size().rename(columns={"size": "count"})
+    return grp.sort_values(["dq_rank", "count", "code"], ascending=[True, False, True]).reset_index(drop=True)
 
 
 def merge_issues(base: pd.DataFrame, add: pd.DataFrame) -> pd.DataFrame:

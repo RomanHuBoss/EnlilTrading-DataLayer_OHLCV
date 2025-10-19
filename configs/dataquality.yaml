@@ -1,0 +1,23 @@
+mode: repair_safe  # поведение санитайзера
+
+# Базовые допуски и сравнения
+misaligned_tolerance_seconds: 1
+epsilon_rel: 1e-6
+
+# Окна и пороги статистики
+vol_window: 50
+atr_window: 14
+ret_window: 50
+z_thr_vol: 6.0
+z_thr_atr: 6.0
+z_thr_ret: 8.0
+
+# Последовательности нулевых объёмов
+zero_run_len_warn: 5
+
+# Выводы/логирование
+outputs:
+  issues_dir: /data_qa/issues/
+  quality_report: /data_qa/quality_{symbol}_{tf}.json
+logging:
+  level: INFO

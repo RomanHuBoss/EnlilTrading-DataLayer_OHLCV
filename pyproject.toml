@@ -3,71 +3,45 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "c1-ohlcv"
+name = "ohlcv"
 version = "0.1.0"
-description = "Пайплайн C1+C3 (+C4 опционально): минутные OHLCV, Parquet-хранилище, ресемплинг, признаки, режимы"
-authors = [{ name = "Project" }]
+description = "C1/C2/C3/C4 data layer for OHLCV: ingest, quality, features, regime"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+authors = [{ name = "quant-team" }]
 license = { text = "Proprietary" }
-keywords = ["ohlcv", "bybit", "parquet", "resample", "data-quality", "features", "regime"]
-
-# Базовый слой (C1/C3): только необходимые зависимостии
-# C4 выведен в extras "regime".
+keywords = ["ohlcv", "trading", "bybit", "data-quality", "features", "regime"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent",
+]
 dependencies = [
+  "pandas>=2.0,<3.0",
   "numpy>=1.23",
-  "pandas>=1.5",
-  "pyarrow>=12",
-  "requests>=2.31",
+  "click>=8.1",
+  "requests>=2.28",
 ]
 
 [project.optional-dependencies]
-# Запуск тестов
-test = [
-  "pytest>=7.4",
-]
-# Разработка
-dev = [
-  "pytest>=7.4",
-  "black>=23.0",
-  "isort>=5.12",
-  "mypy>=1.5",
-]
-# Режимы рынка (C4): ставится при необходимости
-regime = [
-  "scikit-learn>=1.2",
-  "hmmlearn>=0.3.0",
-  "ruptures>=1.1.7",
-]
-# Удобный агрегат
-all = [
-  "c1-ohlcv[test]",
-  "c1-ohlcv[dev]",
-  "c1-ohlcv[regime]",
-]
+parquet = ["pyarrow>=14"]
+
+aio = []
 
 [project.scripts]
-# CLI C1
-c1-ohlcv = "ohlcv.cli:main"
-# CLI C3
-c3-features = "ohlcv.features.cli:main"
-# CLI C4 (доступен при установке extras "regime")
-c4-regime = "c4_regime.cli:main"
+ohlcv = "ohlcv.cli:main"
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-# Включаем и C1/C3 (ohlcv*), и C4 (c4_regime*)
+where = ["."]
 include = ["ohlcv*", "c4_regime*"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
-# На случай локальных YAML/конфигов внутри пакетов
-"ohlcv" = ["**/*.yaml", "**/*.yml"]
-"c4_regime" = ["**/*.yaml", "**/*.yml"]
+"ohlcv" = ["configs/*.yaml"]
 
-[tool.pytest.ini_options]
-minversion = "7.0"
-addopts = "-q"
-python_files = ["test_*.py"]
+[tool.ohlcv]
+build_signature_env = ["GIT_COMMIT", "CI_COMMIT_SHA", "SOURCE_VERSION", "PYPROJECT_SHA", "GIT_DIRTY"]

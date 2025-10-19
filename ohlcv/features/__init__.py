@@ -1,20 +1,20 @@
-"""
-C3.Features.Core — публичный API пакета.
-Экспортирует compute_features, DEFAULTS, normalize_and_validate, BuildMeta.
-Версия пакета — __version__.
-"""
+# ohlcv/features/__init__.py
+from __future__ import annotations
 
-from .core import DEFAULTS, compute_features
-from .schema import normalize_and_validate
-from .utils import BuildMeta
+from .core import FeatureConfig, build_features, ensure_input  # noqa: F401
+from .schema import (
+    META_COLS,  # noqa: F401
+    infer_feature_cols,  # noqa: F401
+    reorder_columns,  # noqa: F401
+    validate_features_df,  # noqa: F401
+)
 
 __all__ = [
-    "compute_features",
-    "DEFAULTS",
-    "normalize_and_validate",
-    "BuildMeta",
-    "__version__",
+    "FeatureConfig",
+    "build_features",
+    "ensure_input",
+    "META_COLS",
+    "infer_feature_cols",
+    "reorder_columns",
+    "validate_features_df",
 ]
-
-# Версия компонента C3. Поддерживается CLI и BuildMeta.
-__version__ = "0.1.0"
