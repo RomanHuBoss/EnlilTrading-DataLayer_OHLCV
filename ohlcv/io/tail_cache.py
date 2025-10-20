@@ -10,6 +10,8 @@ from typing import Optional
 
 import pandas as pd
 
+__all__ = ["TailInfo", "write", "read", "update", "write_parquet_tail"]
+
 
 # =============================
 # Модель tail-сайдкара
@@ -31,7 +33,7 @@ def _now_iso() -> str:
 
 
 def _tail_dir(root: Path | str, symbol: str) -> Path:
-    return Path(root) / symbol / "tail"
+    return Path(root) / str(symbol) / "tail"
 
 
 def _sidecar_path(root: Path | str, symbol: str, tf: str) -> Path:
@@ -42,7 +44,7 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    os.replace(tmp, path)
+    os.replace(str(tmp), str(path))
 
 
 # =============================
@@ -57,16 +59,19 @@ def write(root: Path | str, info: TailInfo) -> Path:
 
 
 def read(root: Path | str, symbol: str, tf: str) -> Optional[TailInfo]:
-    """Читает tail JSON; возвращает TailInfo или None, если нет файла."""
+    """Читает tail JSON; возвращает TailInfo или None, если нет файла/повреждён."""
     p = _sidecar_path(root, symbol, tf)
     if not p.exists():
         return None
     try:
         obj = json.loads(p.read_text(encoding="utf-8"))
+        latest = obj.get("latest_ts_ms")
+        if latest is None:
+            return None
         return TailInfo(
-            symbol=obj.get("symbol", symbol),
-            tf=obj.get("tf", tf),
-            latest_ts_ms=int(obj["latest_ts_ms"]),
+            symbol=str(obj.get("symbol", symbol)),
+            tf=str(obj.get("tf", tf)),
+            latest_ts_ms=int(latest),
             updated_at_iso=str(obj.get("updated_at_iso") or _now_iso()),
         )
     except Exception:
@@ -108,37 +113,70 @@ def write_parquet_tail(
 ) -> Path:
     """Пишет tail/<tf>.tail.parquet с последними N днями данных.
 
-    Ожидает колонку 'ts' (мс). Если индекс DatetimeIndex — будет использован он.
+    Ожидает колонку 'ts' (мс) или DatetimeIndex. Строгие типы: ts:int64.
+    На входе строки с невалидным ts отбрасываются, искусственных ts=0 не создаётся.
     """
     out_dir = _tail_dir(root, symbol)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{tf}.tail.parquet"
 
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("ожидается DataFrame")
+
+    # Извлечение и очистка временной оси
     if "ts" in df.columns:
-        ts = pd.to_datetime(df["ts"], unit="ms", utc=True)
-        sub = df.copy()
+        ts_numeric = pd.to_numeric(df["ts"], errors="coerce")
+        mask = ts_numeric.notna()
+        sub = df.loc[mask].copy()
+        if sub.empty:
+            try:
+                pd.DataFrame(columns=list(df.columns)).to_parquet(path)
+            except Exception:
+                pass
+            return path
+        sub["ts"] = ts_numeric.loc[mask].astype("int64")
+        ts = pd.to_datetime(sub["ts"].to_numpy("int64"), unit="ms", utc=True)
     elif isinstance(df.index, pd.DatetimeIndex):
-        ts = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
-        sub = df.reset_index().rename(columns={df.index.name or "index": "ts"}).copy()
-        sub["ts"] = (ts.view("int64") // 1_000_000).astype("int64")
+        idx = df.index.tz_convert("UTC") if df.index.tz is not None else df.index.tz_localize("UTC")
+        mask = idx.notna()
+        sub = df.loc[mask].copy()
+        if sub.empty:
+            try:
+                pd.DataFrame(columns=list(df.columns)).to_parquet(path)
+            except Exception:
+                pass
+            return path
+        ts = idx[mask]
+        sub.insert(0, "ts", (ts.view("int64") // 1_000_000).astype("int64"))
     else:
         raise ValueError("ожидается колонка 'ts' или DatetimeIndex")
 
-    cutoff = ts.max() - pd.Timedelta(days=days)
-    mask = ts >= cutoff
-    sub = sub.loc[mask].reset_index(drop=True)
+    if ts.size == 0:
+        try:
+            pd.DataFrame(columns=list(sub.columns)).to_parquet(path)
+        except Exception:
+            pass
+        return path
 
-    # запись parquet: предпочтительно через pyarrow
+    # Обрезка по окну последних N дней
+    cutoff = ts.max() - pd.Timedelta(days=int(days))
+    sub = sub.loc[ts >= cutoff].copy()
+
+    # Сортировка/дедуп по ts
+    sub = sub.sort_values("ts").drop_duplicates("ts", keep="last").reset_index(drop=True)
+
+    # Запись parquet: предпочтительно через pyarrow
     try:
         import pyarrow as pa  # type: ignore
         import pyarrow.parquet as pq  # type: ignore
         table = pa.Table.from_pandas(sub, preserve_index=False)
-        pq.write_table(table, path)
+        pq.write_table(table, str(path))
     except Exception:
         sub.to_parquet(path)
 
-    # обновить JSON tail максимальным ts
-    max_ts = int(sub["ts"].max()) if len(sub) else int((ts.max().value // 1_000_000))
-    update(root, symbol, tf, latest_ts_ms=max_ts)
+    # Обновить JSON tail максимальным ts из субсета
+    if len(sub):
+        max_ts = int(pd.to_numeric(sub["ts"], errors="coerce").max())
+        update(root, symbol, tf, latest_ts_ms=max_ts)
 
     return path

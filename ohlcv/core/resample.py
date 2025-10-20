@@ -1,107 +1,170 @@
-# ohlcv/core/resample.py
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
 
-from .validate import normalize_ohlcv_1m, align_and_flag_gaps
+__all__ = [
+    "META_COLS",
+    "FeatureSchema",
+    "infer_feature_cols",
+    "reorder_columns",
+    "validate_features_df",
+]
 
-__all__ = ["resample_1m_to"]
+# =============================
+# Канон C3
+# =============================
+# Порядок по контракту: базовые колонки входа → symbol, tf → f_* → f_valid_from, f_build_version
+META_COLS: Tuple[str, ...] = (
+    "ts",              # int64 (UTC ms, начало бара)
+    "symbol",          # string
+    "tf",              # string
+    "f_valid_from",    # int64 (индекс первого полного окна, где нет NaN во всех заявленных f_*)
+    "f_build_version", # string
+)
+
+_RESERVED_F_META: Tuple[str, ...] = ("f_valid_from", "f_build_version")
 
 
-def _dst_freq(tf: str) -> Tuple[str, int]:
-    tf = tf.strip().lower()
-    if tf.endswith("m"):
-        n = int(tf[:-1])
-        return f"{n}T", n
-    if tf.endswith("h"):
-        n = int(tf[:-1])
-        return f"{n}H", 60 * n
-    raise ValueError(f"неподдерживаемый целевой tf: {tf}")
+@dataclass(frozen=True)
+class FeatureSchema:
+    meta: Tuple[str, ...] = META_COLS
+    # Остальные — любые столбцы с префиксом f_
+
+    def all(self, fcols: Iterable[str]) -> List[str]:
+        return list(self.meta) + [c for c in fcols if c not in self.meta]
 
 
-def _to_right_label_ms(idx: pd.DatetimeIndex) -> pd.Series:
-    """Преобразует DatetimeIndex групп к правой границе в миллисекундах."""
-    return (idx.view("int64") // 1_000_000).astype("int64")
+# =============================
+# Вспомогательные
+# =============================
+
+_BASE_ORDER = [
+    # Таймштамп и производные
+    "ts", "timestamp_ms", "start_time_iso",
+    # OHLCV по канону C1/C2
+    "o", "h", "l", "c", "v", "t",
+    # Альтернативные имена (на случай внешнего ввода)
+    "open", "high", "low", "close", "volume", "turnover",
+]
 
 
-def resample_1m_to(df_1m: pd.DataFrame, dst_tf: str) -> pd.DataFrame:
-    """Ресемплинг 1m → dst_tf (5m/15m/1h) по правой границе окна.
-
-    Вход: DataFrame 1m со столбцами o,h,l,c,v[,t] и/или колонкой ts либо DatetimeIndex UTC.
-    Алгоритм:
-      1) normalize_ohlcv_1m → align_and_flag_gaps(strict=True) для полной минутной сетки и is_gap по минутам.
-      2) Группировка по dst_tf (правые границы).
-      3) Агрегаты: o=first, h=max, l=min, c=last, v=sum, t=sum; is_gap=any или недобор минут.
-      4) Вывод: ts=int64 (мс, правая граница), канонический порядок столбцов.
+def infer_feature_cols(df: pd.DataFrame) -> List[str]:
+    """Стабильный список фич с префиксом f_, отсортированный лексикографически.
+    Исключаются служебные f_valid_from и f_build_version.
     """
-    if df_1m is None or len(df_1m) == 0:
-        return pd.DataFrame(columns=["ts", "o", "h", "l", "c", "v", "t", "is_gap"]).astype({"ts": "int64"})
+    cols = []
+    for c in df.columns:
+        if not isinstance(c, str):
+            continue
+        if not c.startswith("f_"):
+            continue
+        if c in _RESERVED_F_META:
+            continue
+        cols.append(c)
+    return sorted(cols)
 
-    # Шаг 1: нормализация и выравнивание минутной сетки
-    norm = normalize_ohlcv_1m(df_1m)
-    aligned, _stats = align_and_flag_gaps(norm, strict=True)
 
-    freq, nmin = _dst_freq(dst_tf)
+def _order_base_cols(df: pd.DataFrame) -> List[str]:
+    """Стабильный порядок для базовых колонок входа (оставляем только существующие)."""
+    seen = []
+    present = set(df.columns)
+    for c in _BASE_ORDER:
+        if c in present and c not in seen:
+            seen.append(c)
+    return seen
 
-    # Группировка правыми границами
-    g = aligned.groupby(pd.Grouper(freq=freq, label="right", closed="right"))
 
-    out = pd.DataFrame(index=g.size().index)
+def _uniq_keep_order(seq: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
-    # Агрегаты OHLCV
-    out["o"] = g["o"].first()
-    out["h"] = g["h"].max()
-    out["l"] = g["l"].min()
-    out["c"] = g["c"].last()
-    out["v"] = g["v"].sum()
-    if "t" in aligned.columns:
-        out["t"] = g["t"].sum()
 
-    # is_gap окна: если любая минута внутри окна is_gap=True ИЛИ окно неполное по числу минут
-    # (неполные окна возникают на краях диапазона или при дырках до выравнивания; последние уже помечены минутными is_gap)
-    any_gap = g["is_gap"].any()
+def reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Выставляет канонический порядок C3:
+    base(в порядке _BASE_ORDER, как есть) → symbol, tf → f_* (sorted) → f_valid_from, f_build_version → прочие.
+    """
+    cols = list(df.columns)
+    base = _order_base_cols(df)
 
-    # число минут в каждом окне
-    cnt = g.size().rename("count").astype("int64")
-    out["is_gap"] = any_gap.reindex(out.index).fillna(False).astype(bool)
-    out.loc[cnt < nmin, "is_gap"] = True
+    st = [c for c in ("symbol", "tf") if c in cols]
 
-    # Индекс → ts (правая граница окна)
-    out_ts = _to_right_label_ms(out.index)
-    out = out.reset_index(drop=True)
-    out.insert(0, "ts", out_ts.values)
+    fcols = infer_feature_cols(df)
 
-    # Типы
-    for c in ["o", "h", "l", "c", "v"]:
+    tail_meta = [c for c in ("f_valid_from", "f_build_version") if c in cols]
+
+    others = [c for c in cols if c not in set(base) | set(st) | set(fcols) | set(tail_meta)]
+
+    order = _uniq_keep_order(base + st + fcols + tail_meta + others)
+    return df[order]
+
+
+# =============================
+# Валидатор/нормализатор
+# =============================
+
+def _coerce_types(df: pd.DataFrame, *, strict: bool) -> pd.DataFrame:
+    out = df.copy()
+    # ts/f_valid_from → числовые
+    if "ts" in out.columns:
+        out["ts"] = pd.to_numeric(out["ts"], errors="coerce")
+    if "f_valid_from" in out.columns:
+        out["f_valid_from"] = pd.to_numeric(out["f_valid_from"], errors="coerce")
+
+    if strict:
+        if "ts" not in out.columns:
+            raise ValueError("отсутствует обязательная колонка: ts")
+        if out["ts"].isna().any():
+            raise ValueError("ts содержит NaN после приведения типов")
+        if "f_valid_from" in out.columns and out["f_valid_from"].isna().any():
+            raise ValueError("f_valid_from содержит NaN после приведения типов")
+    else:
+        if "ts" in out.columns:
+            out = out.loc[~out["ts"].isna()].copy()
+        if "f_valid_from" in out.columns:
+            out["f_valid_from"] = out["f_valid_from"].fillna(out.get("ts"))
+
+    if "ts" in out.columns:
+        out["ts"] = out["ts"].astype("int64")
+    if "f_valid_from" in out.columns:
+        out["f_valid_from"] = out["f_valid_from"].astype("int64")
+
+    for c in ["symbol", "tf", "f_build_version"]:
+        if c in out.columns:
+            out[c] = out[c].astype("string")
+
+    for c in infer_feature_cols(out):
         out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
-    if "t" in out.columns:
-        out["t"] = pd.to_numeric(out["t"], errors="coerce").astype("float64")
-    out["is_gap"] = out["is_gap"].astype(bool)
-    out["ts"] = out["ts"].astype("int64")
 
-    # Канонический порядок
-    cols = ["ts", "o", "h", "l", "c", "v"]
-    if "t" in out.columns:
-        cols.append("t")
-    cols.append("is_gap")
-    out = out[cols]
+    return out
 
-    # Удалить полностью пустые окна (в теории не встречаются после strict=True, оставлено на всякий случай)
-    empty_mask = out[[c for c in ["o", "h", "l", "c"]]].isna().all(axis=1)
-    if empty_mask.any():
-        # Синтетика: o=h=l=c=prev_close, v=0, is_gap=True
-        prev_c = out["c"].ffill()
-        for c in ["o", "h", "l", "c"]:
-            out.loc[empty_mask, c] = prev_c.loc[empty_mask]
-        out.loc[empty_mask, "v"] = 0.0
-        if "t" in out.columns:
-            out.loc[empty_mask, "t"] = 0.0
-        out.loc[empty_mask, "is_gap"] = True
 
-    # Финальная сортировка по ts, дедуп по ts
-    out = out.sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
+def validate_features_df(df: pd.DataFrame, *, strict: bool = True) -> pd.DataFrame:
+    """Приводит DataFrame с фичами к канону C3.
 
+    Правила:
+    - Наличие META_COLS при strict=True.
+    - Типы: ts/f_valid_from → int64; все f_* → float64; строки → pandas-string.
+    - Удаление дубликатов по ts (последний wins), сортировка по ts.
+    - Порядок столбцов: base → symbol,tf → f_* → f_valid_from,f_build_version → прочие.
+    """
+    if strict:
+        missing = [c for c in META_COLS if c not in df.columns]
+        if missing:
+            raise ValueError(f"отсутствуют обязательные столбцы: {missing}")
+
+    out = _coerce_types(df, strict=strict)
+
+    if "ts" in out.columns:
+        out = out.sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
+
+    out = reorder_columns(out)
     return out

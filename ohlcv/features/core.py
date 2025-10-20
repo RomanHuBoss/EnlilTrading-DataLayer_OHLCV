@@ -1,50 +1,62 @@
+# ohlcv/features/core.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-__all__ = ["FeatureConfig", "build_features", "ensure_input"]
-
+__all__ = [
+    "FeatureConfig",
+    "DEFAULTS",
+    "ensure_input",
+    "compute_features",
+    "normalize_and_validate",
+]
 
 # =============================
-# Конфиг
+# Конфиг (C3)
 # =============================
+
 @dataclass(frozen=True)
 class FeatureConfig:
-    # окна (по барам tf)
-    atr: int = 14
-    rsi: int = 14
-    adx: int = 14
-    donch: int = 20
-    z_price: int = 60
-    z_vol: int = 60
-    vwap_roll: int = 96  # условно ≈ 1 сессия для 15m (настраивается снаружи)
-    # версия сборки
-    build_version: str = "C3-1.0"
+    # окна
+    rv: tuple[int, int] = (20, 60)            # std(logret, n), ddof=1
+    ema: tuple[int, int] = (20, 50)           # EMA по close
+    mom: tuple[int, int, int] = (20, 50, 100) # C/C_{t-n} - 1
+    rsi: int = 14                              # RSI Уайлдера
+    adx: int = 14                              # ADX/+DI/-DI Уайлдера
+    donch: tuple[int, int] = (20, 55)          # Donchian
+    z: tuple[int, int] = (20, 60)              # Z-score окна
+    vwap_roll: int = 96                        # роллинг-VWAP
+    updownvol: int = 20                        # окно для up/down volume
+    kama: int = 10                             # KAMA (опц.)
 
+    # версия/идентификация
+    build_version: str = "C3-Core-1.4"
+
+DEFAULTS = FeatureConfig()
 
 # =============================
-# Вспомогательные
+# Нормализация входа
 # =============================
 
 def ensure_input(df: pd.DataFrame) -> pd.DataFrame:
-    """Нормализация входа C3.
-
-    Принимает схему с колонками:
-      - либо marketdata: timestamp_ms,start_time_iso,open,high,low,close,volume[,turnover]
-      - либо уже нормализованную: ts,o,h,l,c,v[,t]
-
-    Возвращает DataFrame со столбцами ts(int64), o,h,l,c,v[,t], отсортированный и дедуплицированный.
+    """
+    Вход допускается в двух формах:
+      — marketdata: timestamp_ms,start_time_iso,open,high,low,close,volume[,turnover]
+      — нормализованная: ts,o,h,l,c,v[,t]
+    Выход: DataFrame со столбцами ts:int64, o,h,l,c,v:float64, t:float64? и сортировкой по ts.
     """
     if not isinstance(df, pd.DataFrame):
         raise TypeError("ожидается DataFrame")
     out = df.copy()
 
-    # Переименование при необходимости
-    rename = {
+    # Приведение имён
+    lower = {c: str(c).lower() for c in out.columns}
+    out = out.rename(columns=lower)
+    out = out.rename(columns={
         "timestamp_ms": "ts",
         "open": "o",
         "high": "h",
@@ -52,56 +64,69 @@ def ensure_input(df: pd.DataFrame) -> pd.DataFrame:
         "close": "c",
         "volume": "v",
         "turnover": "t",
-    }
-    out = out.rename(columns=rename)
+    })
 
-    # Индекс→ts при DatetimeIndex
-    if "ts" not in out.columns and isinstance(out.index, pd.DatetimeIndex):
-        ts = out.index
-        ts = ts.tz_convert("UTC") if ts.tz is not None else ts.tz_localize("UTC")
-        out["ts"] = (ts.view("int64") // 1_000_000).astype("int64")
-
+    # ts из DatetimeIndex/start_time_iso при необходимости
     if "ts" not in out.columns:
-        # старт времени из start_time_iso если есть
-        if "start_time_iso" in out.columns:
+        if isinstance(out.index, pd.DatetimeIndex):
+            idx = out.index.tz_convert("UTC") if out.index.tz is not None else out.index.tz_localize("UTC")
+            out["ts"] = (idx.asi8 // 1_000_000).astype("int64")
+        elif "start_time_iso" in out.columns:
             tsi = pd.to_datetime(out["start_time_iso"], utc=True, errors="coerce")
             out["ts"] = (tsi.view("int64") // 1_000_000).astype("int64")
         else:
             raise ValueError("нет колонки 'ts'/'timestamp_ms'/'start_time_iso' и нет DatetimeIndex")
 
+    # Типы
     out["ts"] = pd.to_numeric(out["ts"], errors="coerce").astype("int64")
-    for c in ["o", "h", "l", "c", "v", "t"]:
+    for c in ("o","h","l","c","v","t"):
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
-    out = (
-        out.sort_values("ts")
-        .drop_duplicates(subset=["ts"], keep="last")
-        .reset_index(drop=True)
-    )
 
-    req = ["o", "h", "l", "c", "v"]
-    for c in req:
-        if c not in out.columns:
-            out[c] = np.nan
-    return out[[c for c in ["ts", "o", "h", "l", "c", "v", "t"] if c in out.columns]]
+    # Стабилизация строк
+    out = out.sort_values("ts").drop_duplicates("ts", keep="last").reset_index(drop=True)
+
+    need = {"ts","o","h","l","c","v"}
+    miss = need - set(out.columns)
+    if miss:
+        raise ValueError(f"отсутствуют обязательные колонки: {sorted(miss)}")
+
+    return out[["ts","o","h","l","c","v"] + (["t"] if "t" in out.columns else [])]
+
+
+# =============================
+# Вспомогательные (формулы)
+# =============================
+
+_EPS = 1e-12
 
 
 def _ema(x: pd.Series, n: int) -> pd.Series:
-    return x.ewm(span=n, adjust=False, min_periods=max(2, n // 2)).mean()
+    return x.ewm(span=n, adjust=False, min_periods=n).mean()
 
 
-def _rsi(close: pd.Series, n: int) -> pd.Series:
-    d = close.diff()
+def _ema_wilder(x: pd.Series, n: int) -> pd.Series:
+    return x.ewm(alpha=1.0 / float(n), adjust=False, min_periods=n).mean()
+
+
+def _true_range(h: pd.Series, l: pd.Series, c: pd.Series) -> pd.Series:
+    prev_c = c.shift(1)
+    tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr
+
+
+def _rsi_wilder(c: pd.Series, n: int) -> pd.Series:
+    d = c.diff()
     up = d.clip(lower=0.0)
     dn = (-d).clip(lower=0.0)
-    roll_up = _ema(up, n)
-    roll_dn = _ema(dn, n)
+    roll_up = _ema_wilder(up, n)
+    roll_dn = _ema_wilder(dn, n)
     rs = roll_up / roll_dn.replace(0.0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi
+    out = 100.0 - (100.0 / (1.0 + rs))
+    return out
 
 
-def _pdm_mdm(h: pd.Series, l: pd.Series) -> Tuple[pd.Series, pd.Series]:
+def _pdm_mdm(h: pd.Series, l: pd.Series) -> tuple[pd.Series, pd.Series]:
     up_move = h.diff()
     dn_move = (-l.diff())
     pdm = up_move.where((up_move > dn_move) & (up_move > 0.0), 0.0)
@@ -109,140 +134,257 @@ def _pdm_mdm(h: pd.Series, l: pd.Series) -> Tuple[pd.Series, pd.Series]:
     return pdm, mdm
 
 
-def _adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
+def _adx_wilder(h: pd.Series, l: pd.Series, c: pd.Series, n: int) -> tuple[pd.Series, pd.Series, pd.Series]:
     pdm, mdm = _pdm_mdm(h, l)
-    tr = pd.concat([
-        (h - l).abs(),
-        (h - c.shift(1)).abs(),
-        (l - c.shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    atr = _ema(tr, n)
-    pdi = 100.0 * _ema(pdm, n) / atr.replace(0.0, np.nan)
-    mdi = 100.0 * _ema(mdm, n) / atr.replace(0.0, np.nan)
-    dx = (100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0.0, np.nan))
-    adx = _ema(dx, n)
+    tr = _true_range(h, l, c)
+    atr = _ema_wilder(tr, n)
+    pdi = 100.0 * _ema_wilder(pdm, n) / atr.replace(0.0, np.nan)
+    mdi = 100.0 * _ema_wilder(mdm, n) / atr.replace(0.0, np.nan)
+    dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0.0, np.nan)
+    adx = _ema_wilder(dx, n)
     return pdi, mdi, adx
 
 
 def _rolling_z(x: pd.Series, n: int) -> pd.Series:
-    mu = x.rolling(n, min_periods=max(5, n // 5)).mean()
-    sd = x.rolling(n, min_periods=max(5, n // 5)).std(ddof=1)
+    mu = x.rolling(n, min_periods=n).mean()
+    sd = x.rolling(n, min_periods=n).std(ddof=1)
     return (x - mu) / sd.replace(0.0, np.nan)
 
 
-def _donch(h: pd.Series, l: pd.Series, n: int) -> Tuple[pd.Series, pd.Series]:
-    dh = h.rolling(n, min_periods=max(2, n // 4)).max()
-    dl = l.rolling(n, min_periods=max(2, n // 4)).min()
+def _donch(h: pd.Series, l: pd.Series, n: int) -> tuple[pd.Series, pd.Series]:
+    dh = h.rolling(n, min_periods=n).max()
+    dl = l.rolling(n, min_periods=n).min()
     return dh, dl
 
 
-def _rolling_vwap(c: pd.Series, v: pd.Series, n: int) -> pd.Series:
-    pv = (c * v).rolling(n, min_periods=max(2, n // 4)).sum()
-    vv = v.rolling(n, min_periods=max(2, n // 4)).sum()
-    return pv / vv.replace(0.0, np.nan)
+def _kama(x: pd.Series, n: int) -> pd.Series:
+    if n <= 1:
+        return x.copy().astype("float64")
+    change = (x - x.shift(n)).abs()
+    vol = x.diff().abs().rolling(n, min_periods=n).sum()
+    er = change / vol.replace(0.0, np.nan)
+    sc_fast, sc_slow = 2.0 / (2 + 1), 2.0 / (30 + 1)
+    sc = (er * (sc_fast - sc_slow) + sc_slow) ** 2
+    kama = x.copy().astype("float64")
+    kama.iloc[: n] = np.nan
+    for i in range(n, len(x)):
+        prev = kama.iloc[i - 1] if np.isfinite(kama.iloc[i - 1]) else x.iloc[i - 1]
+        alpha = sc.iloc[i]
+        kama.iloc[i] = prev + alpha * (x.iloc[i] - prev)
+    return kama
 
+
+def _safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
+    return a / (b.replace(0.0, np.nan) + 0.0)
+
+
+def _iso_from_ms(ms: pd.Series) -> pd.Series:
+    # RFC3339 с миллисекундами, строгое "Z"-окончание
+    ms = pd.to_numeric(ms, errors="coerce").astype("int64")
+    base = pd.to_datetime(ms // 1000 * 1000, unit="ms", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%S")
+    mspart = (ms % 1000).astype(int).map(lambda x: f"{x:03d}")
+    return (base + "." + mspart + "Z").astype("string")
 
 # =============================
 # Основной билд
 # =============================
 
-def build_features(
-    df_in: pd.DataFrame,
-    *,
-    symbol: str,
-    tf: str,
-    cfg: Optional[FeatureConfig] = None,
-) -> pd.DataFrame:
-    """Строит фичи C3 по нормализованному входу.
+def compute_features(df_in: pd.DataFrame, *, symbol: str, tf: str, cfg: Optional[FeatureConfig] = None) -> pd.DataFrame:
+    cfg = cfg or DEFAULTS
+    base = ensure_input(df_in)
 
-    Выход: DataFrame со столбцами
-      [ts, symbol, tf, f_valid_from, f_build_version, f_*]
-    Все числовые фичи — float64. ts — int64.
-    """
-    cfg = cfg or FeatureConfig()
-    df = ensure_input(df_in)
+    ts = base["ts"].astype("int64")
+    o = base["o"].astype("float64")
+    h = base["h"].astype("float64")
+    l = base["l"].astype("float64")
+    c = base["c"].astype("float64")
+    v = base["v"].astype("float64")
+    t = base["t"].astype("float64") if "t" in base.columns else None
 
-    ts = df["ts"].astype("int64")
-    o, h, l, c, v = df["o"].astype("float64"), df["h"].astype("float64"), df["l"].astype("float64"), df["c"].astype("float64"), df["v"].astype("float64")
+    out = pd.DataFrame({
+        "ts": ts,                      # канон C3
+        "timestamp_ms": ts,           # для совместимости с внешними витринами
+        "start_time_iso": _iso_from_ms(ts),
+        "open": o, "high": h, "low": l, "close": c, "volume": v,
+    })
+    if t is not None:
+        out["turnover"] = t
+    out["symbol"] = str(symbol)
+    out["tf"] = str(tf)
 
-    out = pd.DataFrame({"ts": ts})
-
-    # Доходности
+    # Базовые
     f_ret1 = c.pct_change()
     with np.errstate(divide="ignore"):
         f_logret1 = np.log(c).diff()
 
-    # TR/ATR
-    tr = pd.concat([(h - l).abs(), (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
-    f_tr = tr
-    f_atr = _ema(tr, cfg.atr)
+    f_rv = {n: f_logret1.rolling(n, min_periods=n).std(ddof=1) for n in cfg.rv}
 
-    # RSI
-    f_rsi = _rsi(c, cfg.rsi)
+    rng = (h - l).abs()
+    body = (c - o).abs()
+    upper_wick = h - np.maximum(o, c)
+    lower_wick = np.minimum(o, c) - l
 
-    # ADX и DIs
-    f_pdi, f_mdi, f_adx = _adx(h, l, c, cfg.adx)
+    f_tr = _true_range(h, l, c)
+    f_atr = _ema_wilder(f_tr, cfg.adx)  # ATR по Уайлдеру на n=14 по умолчанию
+    f_atr_pct = _safe_div(f_atr, c)
+    f_atr_z = _rolling_z(f_atr, cfg.adx)
+
+    # EMA и наклон
+    ema_vals = {n: _ema(c, n) for n in cfg.ema}
+    ema_slope = {n: _safe_div(ema_vals[n] - ema_vals[n].shift(1), ema_vals[n].shift(1)) for n in cfg.ema}
+
+    # Моментум
+    mom_vals = {n: _safe_div(c, c.shift(n)) - 1.0 for n in cfg.mom}
+
+    # RSI/ADX
+    f_rsi = _rsi_wilder(c, cfg.rsi)
+    f_pdi, f_mdi, f_adx = _adx_wilder(h, l, c, cfg.adx)
 
     # Donchian
-    don_h, don_l = _donch(h, l, cfg.donch)
+    dh = {}; dl = {}
+    for n in cfg.donch:
+        dh[n], dl[n] = _donch(h, l, n)
+    donch_width_pct = {n: _safe_div(dh[n] - dl[n], c) for n in cfg.donch}
+    donch_break_dir = {}
+    for n in cfg.donch:
+        br = np.where(c > dh[n], 1.0, np.where(c < dl[n], -1.0, 0.0))
+        donch_break_dir[n] = pd.Series(br, index=c.index, dtype="float64")
 
-    # VWAP (rolling)
-    f_vwap = _rolling_vwap(c, v, cfg.vwap_roll)
+    # Z‑scores
+    z_close = {n: _rolling_z(c, n) for n in cfg.z}
+    z_range = {n: _rolling_z(h - l, n) for n in cfg.z}
+    z_vol = {n: _rolling_z(v.fillna(0.0), n) for n in cfg.z}
 
-    # Z-score цены и объёма
-    f_close_z = _rolling_z(c, cfg.z_price)
-    f_vol_z = _rolling_z(v.fillna(0.0), cfg.z_vol)
+    # Up/Down volume
+    dprice = c.diff()
+    up = v.where(dprice > 0.0, 0.0)
+    down = v.where(dprice < 0.0, 0.0)
+    ud_n = cfg.updownvol
+    f_upvol = up.rolling(ud_n, min_periods=ud_n).sum()
+    f_downvol = down.rolling(ud_n, min_periods=ud_n).sum()
+    f_vol_balance = (f_upvol - f_downvol) / ((f_upvol + f_downvol).replace(0.0, np.nan))
 
-    # Up/Down volume и баланс
-    up = v.where(c.diff() > 0.0, 0.0)
-    down = v.where(c.diff() < 0.0, 0.0)
-    f_upvol = up.rolling(cfg.z_vol, min_periods=max(2, cfg.z_vol // 5)).sum()
-    f_downvol = down.rolling(cfg.z_vol, min_periods=max(2, cfg.z_vol // 5)).sum()
-    f_vol_balance = (f_upvol - f_downvol) / (f_upvol + f_downvol).replace(0.0, np.nan)
+    # OBV
+    sign = np.sign(dprice).fillna(0.0)
+    f_obv = (sign * v).fillna(0.0).cumsum()
 
-    # Сборка
-    out["symbol"] = str(symbol)
-    out["tf"] = str(tf)
+    # VWAPs
+    typical_price = (h + l + c) / 3.0
+    pv = typical_price * v
+    f_vwap_roll = (pv.rolling(cfg.vwap_roll, min_periods=cfg.vwap_roll).sum() /
+                   v.rolling(cfg.vwap_roll, min_periods=cfg.vwap_roll).sum().replace(0.0, np.nan))
+    f_vwap_dev_pct = _safe_div(c - f_vwap_roll, f_vwap_roll)
 
-    out["f_ret1"] = f_ret1.astype("float64")
-    out["f_logret1"] = f_logret1.astype("float64")
-    out["f_tr"] = f_tr.astype("float64")
-    out["f_atr"] = f_atr.astype("float64")
-    out["f_rsi14"] = f_rsi.astype("float64")
-    out["f_pdi14"] = f_pdi.astype("float64")
-    out["f_mdi14"] = f_mdi.astype("float64")
-    out["f_adx14"] = f_adx.astype("float64")
-    out["f_donch_h"] = don_h.astype("float64")
-    out["f_donch_l"] = don_l.astype("float64")
-    out["f_vwap_roll"] = f_vwap.astype("float64")
-    out["f_close_z"] = f_close_z.astype("float64")
-    out["f_vol_z"] = f_vol_z.astype("float64")
-    out["f_upvol"] = f_upvol.astype("float64")
-    out["f_downvol"] = f_downvol.astype("float64")
-    out["f_vol_balance"] = f_vol_balance.astype("float64")
+    ts_dt = pd.to_datetime(ts, unit="ms", utc=True)
+    day = ts_dt.floor("D")
+    pv_cum = pv.groupby(day).cumsum()
+    v_cum = v.groupby(day).cumsum()
+    f_vwap_session = pv_cum / v_cum.replace(0.0, np.nan)
+    f_vwap_session_dev_pct = _safe_div(c - f_vwap_session, f_vwap_session)
 
-    # Граница валидности: первый индекс, где нет NaN в ключевых фичах
-    core_cols = [
-        "f_atr", "f_rsi14", "f_pdi14", "f_mdi14", "f_adx14",
-        "f_donch_h", "f_donch_l", "f_vwap_roll",
-    ]
-    mask_valid = ~out[core_cols].isna().any(axis=1)
-    if mask_valid.any():
-        f_valid_from = int(out.loc[mask_valid, "ts"].iloc[0])
-    else:
-        f_valid_from = int(out["ts"].iloc[-1]) if len(out) else 0
-    out["f_valid_from"] = f_valid_from
-    out["f_build_version"] = cfg.build_version
+    # Прокси ликвидности/спрэда
+    f_liq_proxy = (t if t is not None else (c * v)).astype("float64")
+    f_spread_proxy = donch_width_pct[cfg.donch[0]]  # ширина Donchian fast
 
-    # Порядок колонок: служебные → фичи
-    first = ["ts", "symbol", "tf", "f_valid_from", "f_build_version"]
-    rest = [c for c in out.columns if c not in first]
-    out = out[first + rest]
+    # KAMA
+    f_kama = _kama(c, cfg.kama)
 
-    # Стабилизация типов
-    out["ts"] = out["ts"].astype("int64")
-    for c in out.columns:
-        if c not in ("ts", "symbol", "tf", "f_build_version"):
-            if pd.api.types.is_numeric_dtype(out[c]):
-                out[c] = out[c].astype("float64")
+    # Сборка выходных колонок
+    put = out.__setitem__
+    put("f_ret1", f_ret1.astype("float64"))
+    put("f_logret1", f_logret1.astype("float64"))
+    for n, s in f_rv.items():
+        put(f"f_rv_{n}", s.astype("float64"))
+
+    put("f_range_pct", _safe_div(rng, c).astype("float64"))
+    put("f_body_pct", _safe_div(body, c).astype("float64"))
+    put("f_wick_upper_pct", _safe_div(upper_wick, c).astype("float64"))
+    put("f_wick_lower_pct", _safe_div(lower_wick, c).astype("float64"))
+
+    put("f_tr", f_tr.astype("float64"))
+    put(f"f_atr_{cfg.adx}", f_atr.astype("float64"))
+    put(f"f_atr_pct_{cfg.adx}", f_atr_pct.astype("float64"))
+    put(f"f_atr_z_{cfg.adx}", f_atr_z.astype("float64"))
+
+    for n in cfg.ema:
+        put(f"f_ema_close_{n}", ema_vals[n].astype("float64"))
+        put(f"f_ema_slope_{n}", ema_slope[n].astype("float64"))
+
+    for n in cfg.mom:
+        put(f"f_mom_{n}", mom_vals[n].astype("float64"))
+
+    put(f"f_rsi_{cfg.rsi}", f_rsi.astype("float64"))
+    put(f"f_pdi_{cfg.adx}", f_pdi.astype("float64"))
+    put(f"f_mdi_{cfg.adx}", f_mdi.astype("float64"))
+    put(f"f_adx_{cfg.adx}", f_adx.astype("float64"))
+
+    for n in cfg.donch:
+        put(f"f_donch_h_{n}", dh[n].astype("float64"))
+        put(f"f_donch_l_{n}", dl[n].astype("float64"))
+        put(f"f_donch_break_dir_{n}", donch_break_dir[n].astype("float64"))
+        put(f"f_donch_width_pct_{n}", donch_width_pct[n].astype("float64"))
+
+    for n in cfg.z:
+        put(f"f_close_z_{n}", z_close[n].astype("float64"))
+        put(f"f_range_z_{n}", z_range[n].astype("float64"))
+        put(f"f_vol_z_{n}", z_vol[n].astype("float64"))
+
+    put(f"f_upvol_{ud_n}", f_upvol.astype("float64"))
+    put(f"f_downvol_{ud_n}", f_downvol.astype("float64"))
+    put(f"f_vol_balance_{ud_n}", f_vol_balance.astype("float64"))
+    put("f_obv", f_obv.astype("float64"))
+
+    put(f"f_vwap_roll_{cfg.vwap_roll}", f_vwap_roll.astype("float64"))
+    put(f"f_vwap_dev_pct_{cfg.vwap_roll}", f_vwap_dev_pct.astype("float64"))
+    put("f_vwap_session", f_vwap_session.astype("float64"))
+    put("f_vwap_session_dev_pct", f_vwap_session_dev_pct.astype("float64"))
+
+    put("f_liq_proxy", f_liq_proxy.astype("float64"))
+    put("f_spread_proxy", f_spread_proxy.astype("float64"))
+    put(f"f_kama_{cfg.kama}", f_kama.astype("float64"))
+
+    # f_valid_from и f_build_version
+    fcols = [c for c in out.columns if c.startswith("f_")]
+    mask_all = ~out[fcols].isna().any(axis=1)
+    valid_from_idx = int(mask_all.idxmax()) if mask_all.any() else 0
+    out["f_valid_from"] = int(ts.iloc[valid_from_idx]) if len(ts) else 0
+    out["f_build_version"] = str(cfg.build_version)
+
+    # Канонический порядок: meta → f_*
+    meta = ["ts", "timestamp_ms", "start_time_iso", "open", "high", "low", "close", "volume"]
+    if "turnover" in out.columns:
+        meta.append("turnover")
+    meta += ["symbol", "tf", "f_valid_from", "f_build_version"]
+    feat = [c for c in out.columns if c.startswith("f_")]
+    out = out[meta + feat]
+
+    # Типы
+    out["ts"] = pd.to_numeric(out["ts"], errors="coerce").astype("int64")
+    out["timestamp_ms"] = pd.to_numeric(out["timestamp_ms"], errors="coerce").astype("int64")
+    for c in feat:
+        out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
+    out["symbol"] = out["symbol"].astype("string")
+    out["tf"] = out["tf"].astype("string")
+    out["f_build_version"] = out["f_build_version"].astype("string")
+
+    return out
+
+
+# Совместимость старых имён API из тестов
+
+def normalize_and_validate(df_in: pd.DataFrame) -> pd.DataFrame:
+    base = ensure_input(df_in)
+    ts = base["ts"].astype("int64")
+    out = pd.DataFrame({
+        "ts": ts,
+        "timestamp_ms": ts,
+        "start_time_iso": _iso_from_ms(ts),
+        "open": base["o"].astype("float64"),
+        "high": base["h"].astype("float64"),
+        "low": base["l"].astype("float64"),
+        "close": base["c"].astype("float64"),
+        "volume": base["v"].astype("float64"),
+    })
+    if "t" in base.columns:
+        out["turnover"] = base["t"].astype("float64")
     return out

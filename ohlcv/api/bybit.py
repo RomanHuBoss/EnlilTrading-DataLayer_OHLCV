@@ -1,9 +1,9 @@
+# ohlcv/api/bybit.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Any
 
-import math
 import random
 import time
 
@@ -22,10 +22,10 @@ class FetchStats:
 
 
 class BybitClient:
-    """Минимальный клиент Bybit v5 для C1 backfill.
+    """Клиент Bybit v5 для C1-backfill минутных свечей.
 
-    Использует публичный эндпоинт kline v5. Ключ не требуется, но может быть передан.
-    Пагинация реализована временем: следующий чанк начинается после максимального ts.
+    Публичный эндпоинт /v5/market/kline. Ключ не требуется.
+    Пагинация по времени: следующий запрос стартует со следующей минуты после максимального ts.
     """
 
     def __init__(
@@ -35,8 +35,8 @@ class BybitClient:
         read_only_key: Optional[str] = None,
         timeout_s: int = 10,
         max_retries: int = 5,
-        max_concurrent: int = 2,  # зарезервировано
-        category: str = "linear",
+        max_concurrent: int = 2,  # зарезервировано под асинхрон
+        category: str = "linear",  # linear|inverse|option|spot
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.read_only_key = read_only_key
@@ -66,7 +66,6 @@ class BybitClient:
                 self.stats.requests += 1
                 r = requests.get(url, params=params, headers=self._headers(), timeout=self.timeout_s)
                 if r.status_code == 429:
-                    # простой бэкофф по retry-after
                     after = float(r.headers.get("Retry-After", "1"))
                     time.sleep(after)
                     attempt += 1
@@ -81,7 +80,6 @@ class BybitClient:
                 self.stats.retries += 1
                 if attempt > self.max_retries:
                     raise
-                # экспоненциальный бэкофф с джиттером
                 sleep_s = min(60.0, (2 ** min(attempt, 6)) + random.random())
                 time.sleep(sleep_s)
 
@@ -95,47 +93,48 @@ class BybitClient:
         end_ms: int,
         limit: int = 1000,
     ) -> Tuple[pd.DataFrame, Optional[int]]:
-        """Получает свечи 1m в [start_ms, end_ms). Возвращает (df, next_ms).
+        """Получить 1m-свечи в полуинтервале [start_ms, end_ms). Возврат (df, next_ms).
 
-        next_ms — отметка времени, с которой нужно продолжать, либо None, если достигнут конец диапазона.
+        next_ms — отметка, с которой продолжать скачивание; None — достигнут конец диапазона.
         """
         if end_ms <= start_ms:
             return pd.DataFrame(columns=["ts", "o", "h", "l", "c", "v", "t"]), None
 
-        # Ограничим окно одним лимитом по минутам
+        # Одно окно запроса ограничиваем лимитом по минутам
         max_window_ms = limit * 60_000
         local_end = min(end_ms, start_ms + max_window_ms)
 
+        # В API v5 параметр end трактуется как включительная правая граница по времени старта бара.
+        # Чтобы получить полуинтервал [start_ms, local_end) минутных баров, выставляем end = local_end - 60_000.
         params: Dict[str, Any] = {
             "category": self.category,
             "symbol": symbol,
             "interval": "1",
             "start": int(start_ms),
-            # Bybit end — включительно; используем local_end-60_000, чтобы не перехватить лишнюю минуту
-            "end": int(local_end - 1),
+            "end": int(local_end - 60_000),
             "limit": int(limit),
         }
         data = self._get("/v5/market/kline", params=params)
 
-        # Проверка формата ответа
         if int(data.get("retCode", 0)) != 0:
             raise RuntimeError(f"Bybit error: {data.get('retCode')} {data.get('retMsg')}")
+
         result = data.get("result") or {}
         rows = result.get("list") or []
-
         if not rows:
             return pd.DataFrame(columns=["ts", "o", "h", "l", "c", "v", "t"]), None
 
-        # list: [start, open, high, low, close, volume, turnover]
+        # Ответ list: [start, open, high, low, close, volume, turnover]
         df = pd.DataFrame(rows, columns=["ts", "o", "h", "l", "c", "v", "t"]).astype(str)
+
         # Приведение типов
-        df["ts"] = df["ts"].astype("int64")
+        df["ts"] = pd.to_numeric(df["ts"], errors="coerce").astype("Int64").fillna(0).astype("int64")
         for col in ["o", "h", "l", "c", "v", "t"]:
             df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
 
-        # Сортировка и фильтр на всякий случай
+        # Сортировка, дедуп и строгий фильтр целевого полуинтервала
         df = df.sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
-        df = df[(df["ts"] >= start_ms) & (df["ts"] < end_ms)]
+        df = df[(df["ts"] >= start_ms) & (df["ts"] < end_ms)].reset_index(drop=True)
 
         self.stats.pages += 1
         self.stats.rows += int(len(df))
@@ -143,9 +142,10 @@ class BybitClient:
         if len(df) == 0:
             return df, None
 
-        last_ts = int(df["ts"].max())
-        # Если мы исчерпали локальное окно, продолжаем со следующей минуты
-        if last_ts >= (local_end - 60_000) and local_end < end_ms:
+        last_ts = int(df["ts"].iat[-1])
+
+        # Переход к следующему окну: следующая минута после последнего бара в этом окне
+        if local_end < end_ms and last_ts >= (local_end - 60_000):
             next_ms = last_ts + 60_000
         else:
             next_ms = None

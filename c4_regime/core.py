@@ -1,3 +1,4 @@
+# c4_regime/core.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,34 +7,49 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from .detectors import (
+    d1_adx_trend,
+    d2_donch_width,
+    d3_bocpd_proxy,
+    d4_hmm_rv_or_quantile,
+)
+
 __all__ = ["RegimeConfig", "infer_regime"]
 
 
 # =============================
-# Конфиг
+# Конфиг C4
 # =============================
 @dataclass(frozen=True)
 class RegimeConfig:
     # Ансамбль
     vote_K: int = 3
-    N_conf: Dict[str, int] = None  # сколько баров требуется для уверенности
-    N_cooldown: Dict[str, int] = None  # сколько баров заморозки после смены
+    N_conf: Dict[str, int] = None                 # подтверждение: длина пробега одного знака
+    N_cooldown: Dict[str, int] = None             # заморозка после смены, баров
 
     # D1: ADX/DI
-    T_adx: int = 22
-    T_di: int = 5
-    adx_thr: float = 18.0
+    T_adx: float = 22.0
+    T_di: float = 5.0
 
-    # D2: Donchian
+    # D2: Donchian width
     donch_window: int = 20
+    q_low: float = 0.0015
+    q_high: float = 0.0060
 
-    # D3: Change‑point proxy (z‑score |logret|)
-    z_window: int = 64
-    z_thr: float = 3.5
+    # D3: BOCPD proxy
+    bocpd_lambda: int = 200
+    L_min: int = 80
+    sigma_L: float = 20.0
+    stream: str = "logret"  # или "close_z"
 
-    # D4: «HMM‑proxy» по realized volatility
+    # D4: HMM‑proxy по дневной RV (или квантильный фолбэк)
+    hmm_states: int = 2
     N_hmm: int = 180
-    calm_threshold: float = 0.60  # квантиль RV ниже которой считаем «calm»
+    calm_threshold: float = 0.60
+    q_high_rv: float = 0.90
+
+    # Версия
+    build_version: str = "C4-Regime-1.2"
 
     def __post_init__(self):
         object.__setattr__(self, "N_conf", self.N_conf or {"5m": 5, "15m": 5, "1h": 3})
@@ -41,194 +57,166 @@ class RegimeConfig:
 
 
 # =============================
-# Вспомогательные
+# Нормализация входа (ожидаем C3)
 # =============================
 
-def _ensure_input(df: pd.DataFrame) -> pd.DataFrame:
+def _iso_from_ms(ms: pd.Series) -> pd.Series:
+    ms = pd.to_numeric(ms, errors="coerce").astype("int64")
+    base = pd.to_datetime(ms // 1000 * 1000, unit="ms", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%S")
+    frac = (ms % 1000).astype(int).map(lambda x: f"{x:03d}")
+    return (base + "." + frac + "Z").astype("string")
+
+
+def _ensure_features(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("ожидается DataFrame")
     out = df.copy()
-    # Разрешаем как индекс‑время, так и колонку ts
-    if "ts" not in out.columns and isinstance(out.index, pd.DatetimeIndex):
-        ts = out.index.tz_convert("UTC") if out.index.tz is not None else out.index.tz_localize("UTC")
-        out["ts"] = (ts.view("int64") // 1_000_000).astype("int64")
-    if "ts" not in out.columns:
-        raise ValueError("ожидался столбец 'ts' или DatetimeIndex")
-    out["ts"] = pd.to_numeric(out["ts"], errors="coerce").astype("int64")
-    for c in ["o", "h", "l", "c"]:
-        if c not in out.columns:
-            out[c] = np.nan
-        out[c] = pd.to_numeric(out[c], errors="coerce").astype("float64")
-    out = out.sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
-    return out[["ts", "o", "h", "l", "c"]]
+    out.columns = [str(c) for c in out.columns]
 
+    # timestamp_ms
+    if "timestamp_ms" not in out.columns:
+        if "ts" in out.columns:
+            out["timestamp_ms"] = pd.to_numeric(out["ts"], errors="coerce").astype("int64")
+        elif isinstance(out.index, pd.DatetimeIndex):
+            idx = out.index.tz_convert("UTC") if out.index.tz is not None else out.index.tz_localize("UTC")
+            out["timestamp_ms"] = (idx.asi8 // 1_000_000).astype("int64")
+        elif "start_time_iso" in out.columns:
+            tsi = pd.to_datetime(out["start_time_iso"], utc=True, errors="coerce")
+            out["timestamp_ms"] = (tsi.view("int64") // 1_000_000).astype("int64")
+        else:
+            raise ValueError("нет timestamp_ms/ts/start_time_iso и нет DatetimeIndex")
 
-def _ema(x: pd.Series, n: int) -> pd.Series:
-    return x.ewm(span=n, adjust=False, min_periods=max(2, n // 2)).mean()
+    if "start_time_iso" not in out.columns:
+        out["start_time_iso"] = _iso_from_ms(out["timestamp_ms"])  # RFC3339 .sssZ
 
+    if "symbol" not in out.columns:
+        out["symbol"] = "?"
+    if "tf" not in out.columns:
+        out["tf"] = "?"
 
-def _adx(h: pd.Series, l: pd.Series, c: pd.Series, n: int, n_di: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    up_move = h.diff()
-    dn_move = (-l.diff())
-    pdm = up_move.where((up_move > dn_move) & (up_move > 0.0), 0.0)
-    mdm = dn_move.where((dn_move > up_move) & (dn_move > 0.0), 0.0)
-    tr = pd.concat([(h - l).abs(), (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
-    atr = _ema(tr, n)
-    pdi = 100.0 * _ema(pdm, n_di) / atr.replace(0.0, np.nan)
-    mdi = 100.0 * _ema(mdm, n_di) / atr.replace(0.0, np.nan)
-    dx = (100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0.0, np.nan))
-    adx = _ema(dx, n)
-    return pdi, mdi, adx
+    # close (для резервных потоков)
+    if "close" not in out.columns and "c" in out.columns:
+        out["close"] = pd.to_numeric(out["c"], errors="coerce").astype("float64")
 
-
-def _donch_breakout(c: pd.Series, h: pd.Series, l: pd.Series, n: int) -> pd.Series:
-    hh = h.rolling(n, min_periods=max(2, n // 4)).max().shift(1)
-    ll = l.rolling(n, min_periods=max(2, n // 4)).min().shift(1)
-    sig = pd.Series(0.0, index=c.index)
-    sig = sig.where(~(c > hh), 1.0)
-    sig = sig.where(~(c < ll), -1.0)
-    return sig
-
-
-def _zscore(x: pd.Series, n: int) -> pd.Series:
-    mu = x.rolling(n, min_periods=max(5, n // 5)).mean()
-    sd = x.rolling(n, min_periods=max(5, n // 5)).std(ddof=1)
-    return (x - mu) / sd.replace(0.0, np.nan)
-
-
-def _rv(logret: pd.Series, n: int) -> pd.Series:
-    return logret.rolling(n, min_periods=max(5, n // 5)).std(ddof=1)
+    out = out.sort_values("timestamp_ms").drop_duplicates("timestamp_ms", keep="last").reset_index(drop=True)
+    out["timestamp_ms"] = pd.to_numeric(out["timestamp_ms"], errors="coerce").astype("int64")
+    if "close" in out.columns:
+        out["close"] = pd.to_numeric(out["close"], errors="coerce").astype("float64")
+    return out
 
 
 # =============================
-# Детекторы
-# =============================
-
-def _D1_adx_trend(df: pd.DataFrame, cfg: RegimeConfig) -> pd.Series:
-    pdi, mdi, adx = _adx(df["h"], df["l"], df["c"], cfg.T_adx, cfg.T_di)
-    # Сигнал направления по DI; подтверждение ADX
-    dir_raw = np.sign((pdi - mdi).fillna(0.0))
-    strong = (adx >= cfg.adx_thr).astype(int)
-    sig = (dir_raw * strong).astype(float).fillna(0.0)
-    return sig
-
-
-def _D2_donch(df: pd.DataFrame, cfg: RegimeConfig) -> pd.Series:
-    return _donch_breakout(df["c"], df["h"], df["l"], cfg.donch_window)
-
-
-def _D3_changepoint(df: pd.DataFrame, cfg: RegimeConfig) -> pd.Series:
-    with np.errstate(divide="ignore"):
-        lr = np.log(df["c"]).diff()
-    z = _zscore(lr.abs(), cfg.z_window)
-    # событие смены — редкий импульс волатильности; направление по знаку lr
-    event = (z > cfg.z_thr).astype(int)
-    sig = np.sign(lr).fillna(0.0) * event
-    return sig.replace(np.nan, 0.0)
-
-
-def _D4_hmm_proxy(df: pd.DataFrame, cfg: RegimeConfig) -> pd.Series:
-    with np.errstate(divide="ignore"):
-        lr = np.log(df["c"]).diff()
-    rv = _rv(lr, cfg.N_hmm)
-    # Квантиль по скользящему окну N_hmm
-    q = rv.rolling(cfg.N_hmm, min_periods=max(8, cfg.N_hmm // 6)).quantile(cfg.calm_threshold)
-    calm = (rv <= q).astype(int)  # 1 — calm, 0 — volatile
-    return calm.fillna(0).astype(float)
-
-
-# =============================
-# Ансамбль/пост‑процессинг
+# Подтверждение и заморозка
 # =============================
 
 def _stable_sign(s: pd.Series, n_conf: int) -> pd.Series:
-    """Требование удержания знака не менее n_conf баров подряд."""
     x = s.fillna(0.0).astype(float)
-    # Ряды непрерывного согласия знака
-    same = np.sign(x).replace(0.0, np.nan)
-    grp = (same != same.shift()).cumsum()
-    run = same.groupby(grp).transform(lambda g: np.arange(1, len(g) + 1)).fillna(0)
-    ok = (run >= n_conf).astype(int)
-    return (np.sign(x) * ok).astype(float)
+    sign = pd.Series(np.sign(x.values), index=x.index)
+    # последовательности одинакового знака
+    grp = (sign != sign.shift()).cumsum()
+    run = grp.groupby(grp).cumcount() + 1
+    ok = (run >= int(n_conf)).astype(int)
+    return (sign * ok).astype(float)
 
 
-def _apply_cooldown(sig: pd.Series, n_cd: int) -> pd.Series:
-    s = sig.fillna(0.0).astype(float).values
+def _apply_cooldown_lock(sig: pd.Series, n_cd: int) -> pd.Series:
+    s = sig.ffill().fillna(0.0).astype(float).values
     out = np.zeros_like(s, dtype=float)
-    cd = 0
     prev = 0.0
+    cd = 0
     for i, v in enumerate(s):
-        if v != 0.0 and np.sign(v) != np.sign(prev):
-            # смена направления → включить cooldown
-            cd = n_cd
-        if cd > 0:
-            out[i] = 0.0
-            cd -= 1
+        proposed = v
+        if i == 0:
+            out[i] = proposed
+            prev = proposed
+            continue
+        if proposed != prev:
+            if cd > 0:
+                out[i] = prev
+                cd -= 1
+            else:
+                out[i] = proposed
+                prev = proposed
+                cd = int(n_cd)
         else:
-            out[i] = v
-        prev = out[i] if out[i] != 0.0 else prev
+            out[i] = prev
+            if cd > 0:
+                cd -= 1
     return pd.Series(out, index=sig.index)
 
 
+# =============================
+# Инференс
+# =============================
+
 def infer_regime(df_in: pd.DataFrame, tf: str, cfg: Optional[RegimeConfig] = None) -> pd.DataFrame:
-    """Определение рыночного режима.
-
-    Вход: DataFrame c колонками ts,o,h,l,c (минимум ts,c; h/l восстанавливаются как NaN→c при отсутствии).
-    Выход: DataFrame с колонками:
-      ts:int64, regime:{-1,0,1}, regime_name:str, score:int, d1_adx_trend, d2_donch_breakout, d3_changepoint, d4_calm
-    """
     cfg = cfg or RegimeConfig()
-    df = _ensure_input(df_in)
+    feats = _ensure_features(df_in)
 
-    # Восстановить h/l, если отсутствуют
-    for col in ["h", "l"]:
-        if df[col].isna().all():
-            df[col] = df["c"]
+    # Детекторы D1..D4
+    d1_tr, d1_fl, s_adx = d1_adx_trend(feats, T_adx=cfg.T_adx, T_di=cfg.T_di)
+    d2_tr, d2_fl, s_don = d2_donch_width(
+        feats, low_thr=cfg.q_low, high_thr=cfg.q_high, prefer_window=cfg.donch_window
+    )
+    d3_tr, d3_fl, p_bocpd_trend, chgpt = d3_bocpd_proxy(
+        feats, lam=cfg.bocpd_lambda, L_min=cfg.L_min, sigma_L=cfg.sigma_L, stream=cfg.stream
+    )
+    d4_tr, d4_fl, s_hmm_rv, high_rv = d4_hmm_rv_or_quantile(
+        feats, N_hmm=cfg.N_hmm, calm_threshold=cfg.calm_threshold, q_high_rv=cfg.q_high_rv, n_states=cfg.hmm_states
+    )
 
-    d1 = _D1_adx_trend(df, cfg)  # {-1,0,1}
-    d2 = _D2_donch(df, cfg)      # {-1,0,1}
-    d3 = _D3_changepoint(df, cfg)  # редкие {-1,0,1}
-    d4 = _D4_hmm_proxy(df, cfg)    # {0(calm=0?),1(calm)}
+    # Подтверждение по ТФ
+    n_conf = int(cfg.N_conf.get(tf, 5))
+    v1 = _stable_sign(d1_tr - d1_fl, n_conf)
+    v2 = _stable_sign(d2_tr - d2_fl, n_conf)
+    v3 = _stable_sign(d3_tr - d3_fl, n_conf)
+    v4 = _stable_sign(d4_tr - d4_fl, n_conf)
 
-    # Базовые голоса по направлению — D1, D2 (трендовые), D3 влияет на уверенность
-    votes = pd.DataFrame({"d1": d1, "d2": d2}, index=df.index)
+    votes_trend = (v1.gt(0).astype(int) + v2.gt(0).astype(int) + v3.gt(0).astype(int) + v4.gt(0).astype(int))
+    votes_flat = (v1.lt(0).astype(int) + v2.lt(0).astype(int) + v3.lt(0).astype(int) + v4.lt(0).astype(int))
 
-    # Требование удержания сигнала n_conf
-    n_conf = cfg.N_conf.get(tf, 5)
-    v1 = _stable_sign(votes["d1"], n_conf)
-    v2 = _stable_sign(votes["d2"], n_conf)
+    # Правило 3‑из‑4
+    raw = pd.Series(np.where(votes_trend >= cfg.vote_K, 1, np.where(votes_flat >= cfg.vote_K, -1, np.nan)), index=feats.index)
+    regime_ffill = raw.ffill().fillna(0.0)
 
-    # Суммарный счёт голосов
-    sgn_sum = v1.add(v2, fill_value=0.0)
-    score = (v1.ne(0).astype(int) + v2.ne(0).astype(int)).astype(int)
+    # Заморозка
+    n_cd = int(cfg.N_cooldown.get(tf, 5))
+    regime_locked = _apply_cooldown_lock(regime_ffill, n_cd)
 
-    # Порог голосов
-    regime_raw = sgn_sum.apply(np.sign)
-    enough = (score >= cfg.vote_K).astype(int)
-    regime = (regime_raw * enough).fillna(0.0)
+    # Уверенность ансамбля
+    regime_conf = (np.maximum(votes_trend, votes_flat) / 4.0).astype(float)
 
-    # Влияние calm: если calm==1 → режим 0
-    calm_mask = (d4 >= 1.0)
-    regime = regime.where(~calm_mask, 0.0)
+    # Метка
+    regime_str = np.where(regime_locked > 0, "trend", "flat")
 
-    # События смены (D3) уменьшают уверенность на бар смены
-    regime = regime.where(d3 == 0.0, 0.0)
-
-    # Cooldown
-    n_cd = cfg.N_cooldown.get(tf, 5)
-    regime = _apply_cooldown(regime, n_cd)
-
-    # Оформление
     out = pd.DataFrame({
-        "ts": df["ts"].astype("int64"),
-        "d1_adx_trend": v1.astype("float64"),
-        "d2_donch_breakout": v2.astype("float64"),
-        "d3_changepoint": d3.astype("float64"),
-        "d4_calm": d4.astype("float64"),
+        "timestamp_ms": feats["timestamp_ms"].astype("int64"),
+        "start_time_iso": feats["start_time_iso"].astype("string"),
+        "symbol": feats["symbol"].astype("string"),
+        "tf": pd.Series([tf] * len(feats), index=feats.index, dtype="string"),  # tf из аргумента
+        "regime": pd.Series(regime_str, index=feats.index, dtype="string"),
+        "high_rv": pd.to_numeric(high_rv, errors="coerce").astype("int8"),
+        "regime_confidence": regime_conf.astype("float64"),
+        "votes_trend": votes_trend.astype("int16"),
+        "votes_flat": votes_flat.astype("int16"),
+        "det_used": pd.Series(["1111"] * len(feats), index=feats.index, dtype="string"),
+        "chgpt": pd.to_numeric(chgpt, errors="coerce").astype("int8"),
+        "p_bocpd_trend": pd.to_numeric(p_bocpd_trend, errors="coerce").astype("float64"),
+        "p_bocpd_flat": (1.0 - pd.to_numeric(p_bocpd_trend, errors="coerce")).astype("float64"),
+        "s_adx": pd.to_numeric(s_adx, errors="coerce").astype("float64"),
+        "s_donch": pd.to_numeric(s_don, errors="coerce").astype("float64"),
+        "s_hmm_rv": pd.to_numeric(s_hmm_rv, errors="coerce").astype("float64"),
+        "hysteresis_state": regime_locked.astype("float64"),
+        "build_version": pd.Series([cfg.build_version] * len(feats), index=feats.index, dtype="string"),
     })
 
-    out["score"] = (out[["d1_adx_trend", "d2_donch_breakout"]].ne(0).sum(axis=1)).astype("int64")
-    out["regime"] = regime.astype("int8")
-    out["regime_name"] = out["regime"].map({-1: "bear", 0: "calm", 1: "bull"}).astype("string")
-
-    # Порядок колонок
-    out = out[["ts", "regime", "regime_name", "score", "d1_adx_trend", "d2_donch_breakout", "d3_changepoint", "d4_calm"]]
+    cols = [
+        "timestamp_ms", "start_time_iso", "symbol", "tf",
+        "regime", "high_rv", "regime_confidence",
+        "votes_trend", "votes_flat", "det_used", "chgpt",
+        "p_bocpd_trend", "p_bocpd_flat",
+        "s_adx", "s_donch", "s_hmm_rv",
+        "hysteresis_state", "build_version",
+    ]
+    out = out[cols]
     return out.reset_index(drop=True)
