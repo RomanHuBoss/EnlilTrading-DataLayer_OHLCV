@@ -1,20 +1,21 @@
-# Конфиг C3 Features — пример. Все поля опциональны, отсутствующие берут значения по умолчанию.
-rv_windows: [20, 60]          # rolling std(logret, n), ddof=1
-z_windows: [20, 96]            # окна для z-score (close/range/volume/ATR)
-ema_windows: [20, 50]          # EMA по close
-sma_windows: [20, 50]          # SMA по close
-mom_windows: [20, 50, 100]     # моментумы по close
+# Пример конфига для построения признаков C3
+# Соответствует полям FeatureConfig из ohlcv.features.core
+# Скопируйте как features.yaml и при необходимости измените окна.
 
-# Каналы волатильности и тренда
-atr_window: 14                 # ATR (Wilder)
-adx_window: 14                 # ADX/DI (Wilder)
-rsi_window: 14                 # RSI
+# Окна для реализованной волатильности (std лог-ретёрнов)
+rv: [30, 60, 120, 180]
 
-# Каналы диапазона и ликвидности
-donch_windows: [20, 55]        # Donchian HH/LL/width (+ *_pct и break_dir)
-vwap_roll_window: 96           # скользящий VWAP (кол-во баров)
-updownvol_window: 20           # окна для upvol/downvol/vol_balance
+# Окна EMA по close
+ema: [5, 10, 20, 50]
 
-# Поведение
-strict: false                  # строгая валидация входа (NaN/инварианты → ошибка)
-build_version: null            # явная версия сборки; если null — вычисляется автоматически
+# Окна моментума (c - c.shift(k))
+mom: [1, 5, 10]
+
+# Окна Donchian для ширины коридора
+donch: [20, 55]
+
+# Окна Z-score по close
+z: [60, 120]
+
+# Метка версии сборки признаков
+build_version: "C3-Features-1.2"

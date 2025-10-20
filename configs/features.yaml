@@ -1,20 +1,10 @@
-symbol: BTCUSDT
-tf: 15m
+# C3 Features configuration
+# Ключи соответствуют FeatureConfig из ohlcv.features.core
 
-params:
-  atr: 14
-  rsi: 14
-  adx: 14
-  donch: 20
-  z_price: 60
-  z_vol: 60
-  vwap_roll: 96
-  build_version: "C3-1.0"
+rv: [30, 60, 120, 180]        # окна для реализованной волатильности (std лог-ретёрнов)
+ema: [5, 10, 20, 50]           # окна EMA по close
+mom: [1, 5, 10]                # окна моментума (c - c.shift(k))
+donch: [20, 55]                # окна Donchian для ширины коридора
+z: [60, 120]                   # окна Z-score по close
 
-outputs:
-  format: parquet
-  path: /data/features/{symbol}_{tf}.parquet
-  include_meta: true
-
-logging:
-  level: INFO
+build_version: "C3-Features-1.2"

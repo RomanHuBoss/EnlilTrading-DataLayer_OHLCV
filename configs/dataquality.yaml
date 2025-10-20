@@ -1,23 +1,118 @@
-mode: repair_safe  # поведение санитайзера
+# C2 Data Quality rules
+version: "C2-1.0"
 
-# Базовые допуски и сравнения
-misaligned_tolerance_seconds: 1
-epsilon_rel: 1e-6
+scope:
+  symbols: ["*"]
+  tfs: ["1m", "3m", "5m", "15m", "1h"]
 
-# Окна и пороги статистики
-vol_window: 50
-atr_window: 14
-ret_window: 50
-z_thr_vol: 6.0
-z_thr_atr: 6.0
-z_thr_ret: 8.0
+schema:
+  required:
+    ts: int64          # UTC ms
+    o: float64
+    h: float64
+    l: float64
+    c: float64
+    v: float64
+  optional:
+    t: float64         # turnover
+    ver: int32
+    is_gap: bool
+  order: [ts, o, h, l, c, v, t, ver, is_gap]
 
-# Последовательности нулевых объёмов
-zero_run_len_warn: 5
+thresholds:
+  # таймфрейм → минимальный шаг в мс и максимально допустимый разрыв в барах
+  step_ms:
+    "1m": 60000
+    "3m": 180000
+    "5m": 300000
+    "15m": 900000
+    "1h": 3600000
+  max_gap_bars: 2
+  max_dup_bars: 0
+  max_flat_run_bars: 50              # последовательные одинаковые close
+  max_zero_volume_run_bars: 10
+  zscore_window: 100
+  zscore_jump: 8.0                   # |Δlog(c)|/σ > z → выброс
+  wick_ratio_warn: 6.0               # max(|h-c|,|o-l|) / (h-l)
+  price_positive_min: 1e-12
 
-# Выводы/логирование
-outputs:
-  issues_dir: /data_qa/issues/
-  quality_report: /data_qa/quality_{symbol}_{tf}.json
-logging:
-  level: INFO
+checks:
+  - name: monotonic_ts
+    enabled: true
+    rule: ts strictly increasing per symbol/tf
+
+  - name: step_consistency
+    enabled: true
+    rule: (ts[i]-ts[i-1]) == step_ms[tf]
+    allow_last_short: true
+
+  - name: no_duplicates
+    enabled: true
+    rule: no duplicate ts
+
+  - name: gaps
+    enabled: true
+    rule: missing bars per expected grid <= max_gap_bars
+    annotate_is_gap: true
+
+  - name: ohlc_order
+    enabled: true
+    rule: h >= max(o,c,l) and l <= min(o,c,h)
+
+  - name: non_negative
+    enabled: true
+    rule: v>=0 and (t is None or t>=0)
+
+  - name: finite_prices
+    enabled: true
+    rule: all(o,h,l,c) finite and > price_positive_min
+
+  - name: jump_outliers
+    enabled: true
+    rule: |Δlog(c)| zscore over zscore_window <= zscore_jump
+
+  - name: flat_bars
+    enabled: true
+    rule: max run of identical close <= max_flat_run_bars
+
+  - name: zero_volume_runs
+    enabled: true
+    rule: max run of v==0 <= max_zero_volume_run_bars
+
+  - name: wick_ratio
+    enabled: true
+    rule: (h-l)>0 and max(|h-c|,|o-l|)/(h-l) <= wick_ratio_warn
+
+  - name: last_bar_cutoff
+    enabled: true
+    rule: drop bars with ts > floor(now,1m) - 60000
+
+actions:
+  on_fail:
+    monotonic_ts: error
+    step_consistency: error
+    no_duplicates: error
+    gaps: warn
+    ohlc_order: error
+    non_negative: error
+    finite_prices: error
+    jump_outliers: warn
+    flat_bars: warn
+    zero_volume_runs: warn
+    wick_ratio: warn
+    last_bar_cutoff: drop
+
+report:
+  emit_stats: true
+  stats:
+    - name: coverage_bars
+      expr: count(rows)
+    - name: first_ts
+      expr: min(ts)
+    - name: last_ts
+      expr: max(ts)
+    - name: price_quantiles
+      expr: quantiles(c, [0.01,0.05,0.5,0.95,0.99])
+    - name: volume_quantiles
+      expr: quantiles(v, [0.01,0.5,0.95,0.99])
+  sample_limit: 50  # максимум примеров нарушений в отчёте

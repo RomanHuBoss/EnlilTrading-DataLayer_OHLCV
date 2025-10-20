@@ -1,29 +1,38 @@
-ensemble:
-  vote_K: 3
-  N_conf:
-    "5m": 5
-    "15m": 5
-    "1h": 3
-  N_cooldown:
-    "5m": 10
-    "15m": 8
-    "1h": 3
+# C4 Regime configuration
+# Поля соответствуют c4_regime.core.RegimeConfig
 
-D1_adx:
-  T_adx: 22
-  T_di: 5
-  adx_thr: 18.0
+vote_K: 3
 
-D2_donch:
-  window: 20
+N_conf:
+  "5m": 5
+  "15m": 5
+  "1h": 3
 
-D3_changepoint:
-  z_window: 64
-  z_thr: 3.5
+N_cooldown:
+  "5m": 10
+  "15m": 8
+  "1h": 3
 
-D4_hmm_proxy:
-  N_hmm: 180
-  calm_threshold: 0.60
+# D1: ADX/DI
+T_adx: 22.0
+T_di: 5.0
 
-logging:
-  level: INFO
+# D2: Donchian width (в долях цены)
+donch_window: 20
+q_low: 0.0015
+q_high: 0.0060
+
+# D3: BOCPD proxy
+bocpd_lambda: 200
+L_min: 80
+sigma_L: 20.0
+stream: "logret"  # или "close_z"
+
+# D4: HMM‑proxy / квантильный фолбэк
+hmm_states: 2
+N_hmm: 180
+calm_threshold: 0.60
+q_high_rv: 0.90
+
+# Версия сборки (метка в выходе)
+build_version: "C4-Regime-1.2"
